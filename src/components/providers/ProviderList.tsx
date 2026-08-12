@@ -379,9 +379,7 @@ export function ProviderList({
       <ProviderEmptyState
         appId={appId}
         onCreate={onCreate}
-        onImport={
-          appId === "accio" ? undefined : () => importMutation.mutate()
-        }
+        onImport={appId === "accio" ? undefined : () => importMutation.mutate()}
       />
     );
   }

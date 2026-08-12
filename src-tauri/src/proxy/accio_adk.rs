@@ -195,12 +195,12 @@ fn provider_model(provider: &Value, requested: &str) -> String {
 
     let configured = request_text(provider.get("model"));
     if configured.is_empty() {
-        return models
+        models
             .first()
             .and_then(|entry| entry.get("id"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| request_text(provider.get("name")));
+            .unwrap_or_else(|| request_text(provider.get("name")))
     } else {
         configured
     }
@@ -493,10 +493,7 @@ fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, s
         let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| std::io::Error::new(
-                std::io::ErrorKind::Other,
-                error.to_string(),
-            ))?;
+            let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             buffer = buffer.replace("\r\n", "\n");
 
@@ -798,9 +795,9 @@ pub async fn handle_accio_fallback(
         }
     }
 
-    let stream = upstream.bytes_stream().map(|item| {
-        item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))
-    });
+    let stream = upstream
+        .bytes_stream()
+        .map(|item| item.map_err(|error| std::io::Error::other(error.to_string())));
     let mut response = Response::builder()
         .status(status)
         .body(Body::from_stream(stream))

@@ -58,7 +58,10 @@ const UsageFooter: React.FC<UsageFooterProps> = ({
   // 统一的用量查询（自动查询仅对当前激活的供应商启用）
   // OpenCode（累加模式）：使用 isInConfig 代替 isCurrent
   const shouldAutoQuery =
-    appId === "opencode" || appId === "openclaw" || appId === "hermes" || appId === "accio"
+    appId === "opencode" ||
+    appId === "openclaw" ||
+    appId === "hermes" ||
+    appId === "accio"
       ? isInConfig
       : isCurrent;
   const autoQueryInterval = shouldAutoQuery
