@@ -293,6 +293,17 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            // Accio ADK gateway adapter. Accio is launched with
+            // GATEWAY_BASE_URL=http://127.0.0.1:<port>/accio.
+            .route(
+                "/accio/api/adk/llm/generateContent",
+                post(super::accio_adk::handle_adk_llm),
+            )
+            .route(
+                "/accio/api/llm/config/v2",
+                post(super::accio_adk::handle_accio_models),
+            )
+            .route("/accio/*path", any(super::accio_adk::handle_accio_fallback))
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))

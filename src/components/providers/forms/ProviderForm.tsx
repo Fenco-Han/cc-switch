@@ -50,9 +50,14 @@ import {
   hermesProviderPresets,
   type HermesProviderPreset,
 } from "@/config/hermesProviderPresets";
+import {
+  accioProviderPresets,
+  type AccioProviderPreset,
+} from "@/config/accioProviderPresets";
 import { OpenCodeFormFields } from "./OpenCodeFormFields";
 import { OpenClawFormFields } from "./OpenClawFormFields";
 import { HermesFormFields } from "./HermesFormFields";
+import { AccioFormFields } from "./AccioFormFields";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
 import {
   applyTemplateValues,
@@ -105,6 +110,7 @@ import {
   useOmoDraftState,
   useOpenclawFormState,
   useHermesFormState,
+  useAccioFormState,
   useCopilotAuth,
   useCodexOauth,
   useXaiOauth,
@@ -120,9 +126,11 @@ import {
   normalizePricingSource,
 } from "./helpers/opencodeFormUtils";
 import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
+import { ACCIO_DEFAULT_CONFIG } from "./hooks/useAccioFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
+import { useAccioLiveProviderIds } from "@/hooks/useAccio";
 
 type PresetEntry = {
   id: string;
@@ -132,7 +140,8 @@ type PresetEntry = {
     | GeminiProviderPreset
     | OpenCodeProviderPreset
     | OpenClawProviderPreset
-    | HermesProviderPreset;
+    | HermesProviderPreset
+    | AccioProviderPreset;
 };
 
 export const normalizeCodexCatalogModelsForSave = (
@@ -394,7 +403,9 @@ function ProviderFormFull({
                 ? OPENCLAW_DEFAULT_CONFIG
                 : appId === "hermes"
                   ? HERMES_DEFAULT_CONFIG
-                  : CLAUDE_DEFAULT_CONFIG,
+                  : appId === "accio"
+                    ? ACCIO_DEFAULT_CONFIG
+                    : CLAUDE_DEFAULT_CONFIG,
       icon: initialData?.icon ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -708,6 +719,11 @@ function ProviderFormFull({
         id: `hermes-${index}`,
         preset,
       }));
+    } else if (appId === "accio") {
+      return accioProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `accio-${index}`,
+        preset,
+      }));
     }
     return providerPresets
       .filter((p) => !p.hidden)
@@ -926,6 +942,19 @@ function ProviderFormFull({
     isLoading: isHermesLiveProviderIdsLoading,
   } = useHermesLiveProviderIds(appId === "hermes");
 
+  const {
+    data: accioLiveProviderIds = [],
+    isLoading: isAccioLiveProviderIdsLoading,
+  } = useAccioLiveProviderIds(appId === "accio");
+
+  const accioForm = useAccioFormState({
+    initialData,
+    appId,
+    providerId,
+    onSettingsConfigChange: (config) => form.setValue("settingsConfig", config),
+    getSettingsConfig: () => form.getValues("settingsConfig"),
+  });
+
   const additiveExistingProviderKeys = useMemo(() => {
     if (appId === "opencode" && !isAnyOmoCategory) {
       return Array.from(
@@ -958,6 +987,16 @@ function ProviderFormFull({
       );
     }
 
+    if (appId === "accio") {
+      return Array.from(
+        new Set(
+          [...accioForm.existingAccioKeys, ...accioLiveProviderIds].filter(
+            (key) => key !== providerId,
+          ),
+        ),
+      );
+    }
+
     return [];
   }, [
     appId,
@@ -969,6 +1008,8 @@ function ProviderFormFull({
     openclawLiveProviderIds,
     opencodeLiveProviderIds,
     providerId,
+    accioForm.existingAccioKeys,
+    accioLiveProviderIds,
   ]);
 
   const isProviderKeyLockStateLoading = useMemo(() => {
@@ -982,6 +1023,9 @@ function ProviderFormFull({
     if (appId === "hermes") {
       return isHermesLiveProviderIdsLoading;
     }
+    if (appId === "accio") {
+      return isAccioLiveProviderIdsLoading;
+    }
     return false;
   }, [
     appId,
@@ -990,6 +1034,7 @@ function ProviderFormFull({
     isHermesLiveProviderIdsLoading,
     isOpenclawLiveProviderIdsLoading,
     isOpencodeLiveProviderIdsLoading,
+    isAccioLiveProviderIdsLoading,
   ]);
 
   const isProviderKeyLocked = useMemo(() => {
@@ -1003,6 +1048,9 @@ function ProviderFormFull({
     if (appId === "hermes") {
       return hermesLiveProviderIds.includes(providerId);
     }
+    if (appId === "accio") {
+      return accioLiveProviderIds.includes(providerId);
+    }
     return false;
   }, [
     appId,
@@ -1012,6 +1060,7 @@ function ProviderFormFull({
     openclawLiveProviderIds,
     opencodeLiveProviderIds,
     providerId,
+    accioLiveProviderIds,
   ]);
 
   const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
@@ -1158,6 +1207,36 @@ function ProviderFormFull({
         additiveExistingProviderKeys.includes(hermesForm.hermesProviderKey)
       ) {
         toast.error(t("hermes.form.providerKeyDuplicate"));
+        return;
+      }
+    }
+
+    if (appId === "accio") {
+      if (!accioForm.accioProviderKey.trim()) {
+        toast.error(
+          t("accio.form.providerKeyRequired", {
+            defaultValue: "请填写 Provider Key",
+          }),
+        );
+        return;
+      }
+      if (!keyPattern.test(accioForm.accioProviderKey)) {
+        toast.error(
+          t("accio.form.providerKeyInvalid", {
+            defaultValue: "Provider Key 只能包含小写字母、数字和连字符",
+          }),
+        );
+        return;
+      }
+      if (
+        !isProviderKeyLocked &&
+        additiveExistingProviderKeys.includes(accioForm.accioProviderKey)
+      ) {
+        toast.error(
+          t("accio.form.providerKeyDuplicate", {
+            defaultValue: "Provider Key 已存在",
+          }),
+        );
         return;
       }
     }
@@ -1469,6 +1548,8 @@ function ProviderFormFull({
       payload.providerKey = openclawForm.openclawProviderKey;
     } else if (appId === "hermes") {
       payload.providerKey = hermesForm.hermesProviderKey;
+    } else if (appId === "accio") {
+      payload.providerKey = accioForm.accioProviderKey;
     }
 
     if (isAnyOmoCategory && !payload.presetCategory) {
@@ -1748,6 +1829,17 @@ function ProviderFormFull({
     formWebsiteUrl: form.watch("websiteUrl") || "",
   });
 
+  const {
+    shouldShowApiKeyLink: shouldShowAccioApiKeyLink,
+    websiteUrl: accioWebsiteUrl,
+  } = useApiKeyLink({
+    appId: "accio",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
   // 使用端点测速候选 hook
   const speedTestEndpoints = useSpeedTestEndpoints({
     appId,
@@ -1787,6 +1879,9 @@ function ProviderFormFull({
       }
       if (appId === "hermes") {
         hermesForm.resetHermesState();
+      }
+      if (appId === "accio") {
+        accioForm.resetAccioState();
       }
       return;
     }
@@ -1905,6 +2000,27 @@ function ProviderFormFull({
       const config = preset.settingsConfig;
 
       hermesForm.resetHermesState(config);
+
+      form.reset({
+        name: preset.nameKey ? t(preset.nameKey) : preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        settingsConfig: JSON.stringify(config, null, 2),
+        icon: preset.icon ?? "",
+        iconColor: preset.iconColor ?? "",
+      });
+      return;
+    }
+
+    // Accio preset handling
+    if (appId === "accio") {
+      const preset = entry.preset as AccioProviderPreset;
+      const config = preset.settingsConfig;
+
+      accioForm.resetAccioState(config);
+      setActivePreset({
+        id: value,
+        category: preset.category,
+      });
 
       form.reset({
         name: preset.nameKey ? t(preset.nameKey) : preset.name,
@@ -2180,6 +2296,67 @@ function ProviderFormFull({
                       </p>
                     )}
                 </div>
+              ) : appId === "accio" ? (
+                <div className="space-y-2">
+                  <Label htmlFor="accio-key">
+                    {t("accio.form.providerKey", {
+                      defaultValue: "Provider Key",
+                    })}
+                    <span className="text-destructive ml-1">*</span>
+                  </Label>
+                  <Input
+                    id="accio-key"
+                    value={accioForm.accioProviderKey}
+                    onChange={(e) =>
+                      accioForm.setAccioProviderKey(
+                        e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""),
+                      )
+                    }
+                    placeholder={t("accio.form.providerKeyPlaceholder", {
+                      defaultValue: "deepseek",
+                    })}
+                    disabled={
+                      isProviderKeyLocked || isProviderKeyLockStateLoading
+                    }
+                    className={
+                      (additiveExistingProviderKeys.includes(
+                        accioForm.accioProviderKey,
+                      ) &&
+                        !isProviderKeyLocked) ||
+                      (accioForm.accioProviderKey.trim() !== "" &&
+                        !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(
+                          accioForm.accioProviderKey,
+                        ))
+                        ? "border-destructive"
+                        : ""
+                    }
+                  />
+                  {additiveExistingProviderKeys.includes(
+                    accioForm.accioProviderKey,
+                  ) &&
+                    !isProviderKeyLocked && (
+                      <p className="text-xs text-destructive">
+                        {t("accio.form.providerKeyDuplicate", {
+                          defaultValue: "Provider Key 已存在",
+                        })}
+                      </p>
+                    )}
+                  {accioForm.accioProviderKey.trim() !== "" &&
+                    !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(
+                      accioForm.accioProviderKey,
+                    ) && (
+                      <p className="text-xs text-destructive">
+                        {t("accio.form.providerKeyInvalid", {
+                          defaultValue: "只能使用小写字母、数字和连字符",
+                        })}
+                      </p>
+                    )}
+                  <p className="text-xs text-muted-foreground">
+                    {t("accio.form.providerKeyHint", {
+                      defaultValue: "用作 CC Switch 配置中的供应商标识。",
+                    })}
+                  </p>
+                </div>
               ) : undefined
             }
           />
@@ -2448,6 +2625,25 @@ function ProviderFormFull({
             />
           )}
 
+          {/* Accio 专属字段 */}
+          {appId === "accio" && (
+            <AccioFormFields
+              baseUrl={accioForm.accioBaseUrl}
+              onBaseUrlChange={accioForm.handleAccioBaseUrlChange}
+              apiKey={accioForm.accioApiKey}
+              onApiKeyChange={accioForm.handleAccioApiKeyChange}
+              apiFormat={accioForm.accioApiFormat}
+              onApiFormatChange={accioForm.handleAccioApiFormatChange}
+              model={accioForm.accioModel}
+              onModelChange={accioForm.handleAccioModelChange}
+              models={accioForm.accioModels}
+              onModelsChange={accioForm.handleAccioModelsChange}
+              category={category}
+              shouldShowApiKeyLink={shouldShowAccioApiKeyLink}
+              websiteUrl={accioWebsiteUrl}
+            />
+          )}
+
           {/* 配置编辑器：Codex、Claude、Gemini 分别使用不同的编辑器 */}
           {appId === "codex" ? (
             <>
@@ -2536,7 +2732,9 @@ function ProviderFormFull({
               </div>
               {settingsConfigErrorField}
             </>
-          ) : appId === "openclaw" || appId === "hermes" ? (
+          ) : appId === "openclaw" ||
+            appId === "hermes" ||
+            appId === "accio" ? (
             <>
               <div className="space-y-2">
                 <Label htmlFor="settingsConfig">
@@ -2546,13 +2744,21 @@ function ProviderFormFull({
                   value={form.getValues("settingsConfig")}
                   onChange={(config) => form.setValue("settingsConfig", config)}
                   placeholder={
-                    appId === "hermes"
+                    appId === "accio"
                       ? `{
+  "name": "deepseek",
+  "base_url": "https://api.deepseek.com",
+  "api_key": "",
+  "api_format": "openai_chat",
+  "model": "deepseek-chat"
+}`
+                      : appId === "hermes"
+                        ? `{
   "name": "my-provider",
   "base_url": "https://api.example.com/v1",
   "api_key": ""
 }`
-                      : `{
+                        : `{
   "baseUrl": "https://api.example.com/v1",
   "apiKey": "your-api-key-here",
   "api": "openai-completions",

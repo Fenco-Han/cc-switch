@@ -138,6 +138,9 @@ impl ConfigService {
             AppType::Hermes => {
                 // Hermes uses additive mode, no live sync needed
             }
+            AppType::Accio => {
+                // Accio uses additive mode, no live sync needed
+            }
         }
 
         Ok(())

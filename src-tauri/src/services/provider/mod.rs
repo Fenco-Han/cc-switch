@@ -2870,6 +2870,7 @@ impl ProviderService {
                     AppType::OpenCode => remove_opencode_provider_from_live(id)?,
                     AppType::OpenClaw => remove_openclaw_provider_from_live(id)?,
                     AppType::Hermes => remove_hermes_provider_from_live(id)?,
+                    AppType::Accio => crate::accio_config::remove_provider(id).map(|_| ())?,
                     _ => {}
                 }
             }
@@ -2934,6 +2935,9 @@ impl ProviderService {
             }
             AppType::Hermes => {
                 remove_hermes_provider_from_live(id)?;
+            }
+            AppType::Accio => {
+                crate::accio_config::remove_provider(id).map(|_| ())?;
             }
             _ => {
                 return Err(AppError::Message(format!(
@@ -3187,6 +3191,20 @@ impl ProviderService {
                     .push(format!("hermes_model_defaults_failed:{}", provider.id));
             }
         }
+        if matches!(app_type, AppType::Accio) {
+            if let Err(e) = crate::accio_config::apply_switch_defaults(
+                &provider.id,
+                provider.settings_config.clone(),
+            ) {
+                log::warn!(
+                    "Failed to apply Accio defaults after switching to '{}': {e}",
+                    provider.id
+                );
+                result
+                    .warnings
+                    .push(format!("accio_defaults_failed:{}", provider.id));
+            }
+        }
 
         // For additive-mode providers that were DB-only (live_config_managed == Some(false)),
         // flip the flag to true now that the provider has been successfully written to the live
@@ -3203,6 +3221,9 @@ impl ProviderService {
                     AppType::OpenCode => remove_opencode_provider_from_live(&provider.id),
                     AppType::OpenClaw => remove_openclaw_provider_from_live(&provider.id),
                     AppType::Hermes => remove_hermes_provider_from_live(&provider.id),
+                    AppType::Accio => {
+                        crate::accio_config::remove_provider(&provider.id).map(|_| ())
+                    }
                     _ => Ok(()),
                 };
 
@@ -3489,6 +3510,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
+            AppType::Accio => Ok(String::new()),  // Accio doesn't use common config snippets
         }
     }
 
@@ -3506,6 +3528,7 @@ impl ProviderService {
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
             AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
+            AppType::Accio => Ok(String::new()),  // Accio doesn't use common config snippets
         }
     }
 
@@ -4271,6 +4294,15 @@ impl ProviderService {
                     ));
                 }
             }
+            AppType::Accio => {
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.accio.settings.not_object",
+                        "Accio 配置必须是 JSON 对象",
+                        "Accio configuration must be a JSON object",
+                    ));
+                }
+            }
         }
 
         // Validate and clean UsageScript configuration (common for all app types)
@@ -4497,6 +4529,27 @@ impl ProviderService {
                     .unwrap_or("")
                     .to_string();
 
+                Ok((api_key, base_url))
+            }
+            AppType::Accio => {
+                let api_key = provider
+                    .settings_config
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.accio.api_key.missing",
+                            "缺少 API Key",
+                            "API key is missing",
+                        )
+                    })?
+                    .to_string();
+                let base_url = provider
+                    .settings_config
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Ok((api_key, base_url))
             }
         }

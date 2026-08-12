@@ -1,3 +1,4 @@
+mod accio_config;
 mod app_config;
 mod app_store;
 mod auto_launch;
@@ -1595,6 +1596,10 @@ pub fn run() {
             commands::set_hermes_memory,
             commands::get_hermes_memory_limits,
             commands::set_hermes_memory_enabled,
+            // Accio specific
+            commands::get_accio_live_provider_ids,
+            commands::get_accio_live_provider,
+            commands::launch_accio,
             // Global upstream proxy
             commands::get_global_proxy_url,
             commands::set_global_proxy_url,

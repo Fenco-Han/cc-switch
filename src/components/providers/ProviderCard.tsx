@@ -123,6 +123,11 @@ const extractApiUrl = (provider: Provider, fallbackText: string) => {
       return envBase;
     }
 
+    const accioBaseUrl = (config as Record<string, any>)?.base_url;
+    if (typeof accioBaseUrl === "string" && accioBaseUrl.trim()) {
+      return accioBaseUrl;
+    }
+
     const baseUrl = (config as Record<string, any>)?.config;
 
     if (typeof baseUrl === "string" && baseUrl.includes("base_url")) {
@@ -172,7 +177,7 @@ export function ProviderCard({
   // OMO and OMO Slim share the same card behavior
   const isAnyOmo = isOmo || isOmoSlim;
   const handleDisableAnyOmo = isOmoSlim ? onDisableOmoSlim : onDisableOmo;
-  const isAdditiveMode = appId === "opencode" && !isAnyOmo;
+  const isAdditiveMode = appId === "opencode" ? !isAnyOmo : appId === "accio";
 
   const { data: health } = useProviderHealth(provider.id, appId);
 
@@ -246,7 +251,10 @@ export function ProviderCard({
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
   const shouldAutoQuery =
-    appId === "opencode" || appId === "openclaw" || appId === "hermes"
+    appId === "opencode" ||
+    appId === "openclaw" ||
+    appId === "hermes" ||
+    appId === "accio"
       ? isInConfig
       : isCurrent;
   const autoQueryInterval = shouldAutoQuery
@@ -290,9 +298,11 @@ export function ProviderCard({
       ? Boolean(isDefaultModel)
       : appId === "opencode"
         ? false
-        : isAutoFailoverEnabled
-          ? activeProviderId === provider.id
-          : isCurrent;
+        : appId === "accio"
+          ? isInConfig
+          : isAutoFailoverEnabled
+            ? activeProviderId === provider.id
+            : isCurrent;
 
   const shouldUseGreen = !isAnyOmo && isProxyTakeover && isActiveProvider;
   const hasPersistentConfigHighlight = isAdditiveMode && isInConfig;

@@ -895,7 +895,29 @@
     "grokbuild": "Grok Build",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
-    "hermes": "Hermes"
+    "hermes": "Hermes",
+    "accio": "Accio"
+  },
+  "accio": {
+    "form": {
+      "baseUrl": "API エンドポイント",
+      "apiFormat": "API プロトコル",
+      "models": "モデル設定",
+      "addModel": "モデルを追加",
+      "defaultModel": "デフォルトモデル",
+      "modelId": "モデル ID",
+      "modelName": "表示名",
+      "removeModel": "モデルを削除",
+      "reasoningEfforts": "推論レベル",
+      "defaultReasoningEffort": "デフォルトレベル",
+      "noModels": "モデルがありません"
+    },
+    "launch": {
+      "button": "Accio DeepSeek を起動",
+      "success": "Accio を {{model}} で起動しました",
+      "failed": "Accio の起動に失敗しました",
+      "missingProvider": "DeepSeek プロバイダーを追加して有効化してください"
+    }
   },
   "appSwitcher": {
     "more": "その他のアプリ"

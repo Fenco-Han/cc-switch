@@ -181,6 +181,7 @@ impl StreamCheckService {
             }
             AppType::OpenClaw => Self::extract_openclaw_base_url(provider),
             AppType::Hermes => Self::extract_hermes_base_url(provider),
+            AppType::Accio => Self::extract_accio_base_url(provider),
             AppType::ClaudeDesktop => ClaudeAdapter::new()
                 .extract_base_url(provider)
                 .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}"))),
@@ -319,6 +320,23 @@ impl StreamCheckService {
                     "hermes_base_url_missing",
                     "Hermes 供应商缺少 base_url",
                     "Hermes provider is missing `base_url`",
+                )
+            })
+    }
+
+    /// Accio: `{ base_url, api_key, api_format, model }`（snake_case）
+    fn extract_accio_base_url(provider: &Provider) -> Result<String, AppError> {
+        provider
+            .settings_config
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::localized(
+                    "accio_base_url_missing",
+                    "Accio 供应商缺少 base_url",
+                    "Accio provider is missing `base_url`",
                 )
             })
     }

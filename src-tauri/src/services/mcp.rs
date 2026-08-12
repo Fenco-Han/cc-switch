@@ -145,6 +145,9 @@ impl McpService {
             AppType::Hermes => {
                 mcp::sync_single_server_to_hermes(&Default::default(), &server.id, &server.server)?;
             }
+            AppType::Accio => {
+                log::debug!("Accio doesn't support MCP, skipping sync");
+            }
         }
         Ok(())
     }
@@ -180,6 +183,9 @@ impl McpService {
             }
             AppType::Hermes => {
                 mcp::remove_server_from_hermes(id)?;
+            }
+            AppType::Accio => {
+                log::debug!("Accio doesn't support MCP, skipping remove");
             }
         }
         Ok(())

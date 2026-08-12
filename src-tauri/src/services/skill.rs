@@ -565,6 +565,9 @@ impl SkillService {
                     return Ok(custom.join("skills"));
                 }
             }
+            AppType::Accio => {
+                return Err(anyhow!("Accio doesn't support Skills"));
+            }
         }
 
         // 默认路径：回退到用户主目录下的标准位置。
@@ -581,6 +584,7 @@ impl SkillService {
             AppType::OpenCode => home.join(".config").join("opencode").join("skills"),
             AppType::OpenClaw => home.join(".openclaw").join("skills"),
             AppType::Hermes => crate::hermes_config::get_hermes_dir().join("skills"),
+            AppType::Accio => unreachable!("Accio is rejected above"),
         })
     }
 

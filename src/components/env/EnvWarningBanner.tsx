@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import type { EnvConflict } from "@/types/env";
 import { deleteEnvVars } from "@/lib/api/env";
+import { maskEnvConflictValue } from "@/utils/envConflict";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -18,7 +19,7 @@ import {
 interface EnvWarningBannerProps {
   conflicts: EnvConflict[];
   onDismiss: () => void;
-  onDeleted: () => void;
+  onDeleted: (deletedConflicts: EnvConflict[]) => void;
 }
 
 export function EnvWarningBanner({
@@ -84,7 +85,7 @@ export function EnvWarningBanner({
 
       // 清空选择并通知父组件
       setSelectedConflicts(new Set());
-      onDeleted();
+      onDeleted(conflictsToDelete);
     } catch (error) {
       console.error("删除环境变量失败:", error);
       toast.error(t("env.delete.error"), {
@@ -196,7 +197,8 @@ export function EnvWarningBanner({
                               {conflict.varName}
                             </label>
                             <p className="text-xs text-muted-foreground mt-1 break-all">
-                              {t("env.field.value")}: {conflict.varValue}
+                              {t("env.field.value")}:{" "}
+                              {maskEnvConflictValue(conflict)}
                             </p>
                             <p className="text-xs text-muted-foreground mt-1">
                               {t("env.field.source")}:{" "}

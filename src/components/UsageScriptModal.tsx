@@ -284,6 +284,11 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
             apiKey: (config as any).api_key,
             baseUrl: (config as any).base_url,
           };
+        } else if (appId === "accio") {
+          return {
+            apiKey: (config as any).api_key,
+            baseUrl: (config as any).base_url,
+          };
         } else if (appId === "openclaw") {
           // OpenClaw: settingsConfig 顶层扁平（camelCase，对应 openclaw.json）
           return {

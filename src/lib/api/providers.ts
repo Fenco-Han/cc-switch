@@ -21,6 +21,14 @@ export interface SwitchResult {
   warnings: string[];
 }
 
+export interface AccioLaunchResult {
+  providerId: string;
+  model: string;
+  gatewayBaseUrl: string;
+  adkBaseUrl: string;
+  launched: boolean;
+}
+
 export interface OpenTerminalOptions {
   cwd?: string;
 }
@@ -190,6 +198,14 @@ export const providersApi = {
   },
 
   /**
+   * 获取 Accio live 配置中的供应商 ID 列表
+   * 用于前端判断供应商是否已写入 cc-switch-providers.json
+   */
+  async getAccioLiveProviderIds(): Promise<string[]> {
+    return await invoke("get_accio_live_provider_ids");
+  },
+
+  /**
    * 从 OpenClaw live 配置导入供应商到数据库
    * OpenClaw 特有功能：由于累加模式，用户可能已在 openclaw.json 中配置供应商
    */
@@ -203,6 +219,19 @@ export const providersApi = {
    */
   async importHermesFromLive(): Promise<number> {
     return await invoke("import_hermes_providers_from_live");
+  },
+
+  /**
+   * 获取单个 Accio 供应商配置片段。
+   */
+  async getAccioLiveProvider(
+    id: string,
+  ): Promise<Record<string, unknown> | null> {
+    return await invoke("get_accio_live_provider", { providerId: id });
+  },
+
+  async launchAccio(providerId: string): Promise<AccioLaunchResult> {
+    return await invoke("launch_accio", { providerId });
   },
 };
 

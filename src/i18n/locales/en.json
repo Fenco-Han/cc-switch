@@ -895,7 +895,29 @@
     "grokbuild": "Grok Build",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
-    "hermes": "Hermes"
+    "hermes": "Hermes",
+    "accio": "Accio"
+  },
+  "accio": {
+    "form": {
+      "baseUrl": "API Endpoint",
+      "apiFormat": "API Protocol",
+      "models": "Models",
+      "addModel": "Add model",
+      "defaultModel": "Default model",
+      "modelId": "Model ID",
+      "modelName": "Display name",
+      "removeModel": "Remove model",
+      "reasoningEfforts": "Reasoning levels",
+      "defaultReasoningEffort": "Default level",
+      "noModels": "No models configured"
+    },
+    "launch": {
+      "button": "Launch Accio DeepSeek",
+      "success": "Accio launched with {{model}}",
+      "failed": "Failed to launch Accio",
+      "missingProvider": "Add and enable a DeepSeek provider first"
+    }
   },
   "appSwitcher": {
     "more": "More apps"

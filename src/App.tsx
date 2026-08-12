@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   Loader2,
   RefreshCw,
+  Rocket,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -39,9 +40,15 @@ import {
   type ProviderSwitchEvent,
 } from "@/lib/api";
 import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
+import {
+  dismissEnvConflicts,
+  forgetDismissedEnvConflicts,
+  hasUndismissedEnvConflicts,
+} from "@/utils/envConflict";
 import { useProviderActions } from "@/hooks/useProviderActions";
 import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
 import { hermesKeys, useOpenHermesWebUI } from "@/hooks/useHermes";
+import { accioKeys } from "@/hooks/useAccio";
 import { hermesApi } from "@/lib/api/hermes";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
@@ -135,6 +142,7 @@ const VALID_APPS: AppId[] = [
   "opencode",
   "openclaw",
   "hermes",
+  "accio",
 ];
 
 const getInitialApp = (): AppId => {
@@ -183,6 +191,7 @@ function App() {
     useState<SkillsPageSource>("repos");
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isLaunchingAccio, setIsLaunchingAccio] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
@@ -213,6 +222,7 @@ function App() {
     opencode: true,
     openclaw: true,
     hermes: true,
+    accio: false,
   };
 
   const getFirstVisibleApp = (): AppId => {
@@ -224,6 +234,7 @@ function App() {
     if (visibleApps.opencode) return "opencode";
     if (visibleApps.openclaw) return "openclaw";
     if (visibleApps.hermes) return "hermes";
+    if (visibleApps.accio) return "accio";
     return "claude"; // fallback
   };
 
@@ -511,8 +522,7 @@ function App() {
 
         if (flatConflicts.length > 0) {
           setEnvConflicts(flatConflicts);
-          const dismissed = sessionStorage.getItem("env_banner_dismissed");
-          if (!dismissed) {
+          if (hasUndismissedEnvConflicts(flatConflicts)) {
             setShowEnvBanner(true);
           }
         }
@@ -588,8 +598,7 @@ function App() {
             );
             return [...prev, ...newConflicts];
           });
-          const dismissed = sessionStorage.getItem("env_banner_dismissed");
-          if (!dismissed) {
+          if (hasUndismissedEnvConflicts(conflicts)) {
             setShowEnvBanner(true);
           }
         }
@@ -664,6 +673,38 @@ function App() {
     }
   };
 
+  const handleLaunchAccio = async () => {
+    const provider = providers["deepseek"] ?? Object.values(providers)[0];
+    if (!provider) {
+      toast.error(
+        t("accio.launch.missingProvider", {
+          defaultValue: "请先添加并启用 DeepSeek 供应商",
+        }),
+      );
+      return;
+    }
+
+    setIsLaunchingAccio(true);
+    try {
+      const result = await providersApi.launchAccio(provider.id);
+      toast.success(
+        t("accio.launch.success", {
+          defaultValue: `Accio 已通过 ${result.model} 启动`,
+          model: result.model,
+        }),
+      );
+    } catch (error) {
+      const detail = extractErrorMessage(error);
+      toast.error(
+        t("accio.launch.failed", {
+          defaultValue: "启动 Accio 失败",
+        }) + (detail ? `: ${detail}` : ""),
+      );
+    } finally {
+      setIsLaunchingAccio(false);
+    }
+  };
+
   const handleEditProvider = async ({
     provider,
     originalId,
@@ -698,6 +739,10 @@ function App() {
       } else if (activeApp === "hermes") {
         await queryClient.invalidateQueries({
           queryKey: hermesKeys.liveProviderIds,
+        });
+      } else if (activeApp === "accio") {
+        await queryClient.invalidateQueries({
+          queryKey: accioKeys.liveProviderIds,
         });
       }
       toast.success(
@@ -750,7 +795,8 @@ function App() {
     if (
       activeApp === "opencode" ||
       activeApp === "openclaw" ||
-      activeApp === "hermes"
+      activeApp === "hermes" ||
+      activeApp === "accio"
     ) {
       let liveProviderIds: string[] = [];
       try {
@@ -765,10 +811,17 @@ function App() {
                   queryKey: openclawKeys.liveProviderIds,
                   queryFn: () => providersApi.getOpenClawLiveProviderIds(),
                 })
-              : await queryClient.ensureQueryData({
-                  queryKey: hermesKeys.liveProviderIds,
-                  queryFn: () => providersApi.getHermesLiveProviderIds(),
-                });
+              : activeApp === "hermes"
+                ? await queryClient.ensureQueryData({
+                    queryKey: hermesKeys.liveProviderIds,
+                    queryFn: () => providersApi.getHermesLiveProviderIds(),
+                  })
+                : activeApp === "accio"
+                  ? await queryClient.ensureQueryData({
+                      queryKey: accioKeys.liveProviderIds,
+                      queryFn: () => providersApi.getAccioLiveProviderIds(),
+                    })
+                  : Object.keys(providers);
       } catch (error) {
         console.error(
           "[App] Failed to load live provider IDs for duplication",
@@ -1139,14 +1192,15 @@ function App() {
         <EnvWarningBanner
           conflicts={envConflicts}
           onDismiss={() => {
+            dismissEnvConflicts(envConflicts);
             setShowEnvBanner(false);
-            sessionStorage.setItem("env_banner_dismissed", "true");
           }}
-          onDeleted={async () => {
+          onDeleted={async (deletedConflicts) => {
             try {
               const allConflicts = await checkAllEnvConflicts();
               const flatConflicts = Object.values(allConflicts).flat();
               setEnvConflicts(flatConflicts);
+              forgetDismissedEnvConflicts(deletedConflicts);
               if (flatConflicts.length === 0) {
                 setShowEnvBanner(false);
               }
@@ -1622,6 +1676,24 @@ function App() {
                         </motion.div>
                       </AnimatePresence>
                     </div>
+
+                    {activeApp === "accio" && (
+                      <Button
+                        onClick={() => void handleLaunchAccio()}
+                        disabled={isLaunchingAccio}
+                        size="icon"
+                        className="ml-1 bg-amber-500 hover:bg-amber-600 text-white"
+                        title={t("accio.launch.button", {
+                          defaultValue: "启动 Accio DeepSeek",
+                        })}
+                      >
+                        {isLaunchingAccio ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Rocket className="w-4 h-4" />
+                        )}
+                      </Button>
+                    )}
 
                     <Button
                       onClick={() => setIsAddOpen(true)}

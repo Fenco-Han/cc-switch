@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+mod accio;
 mod auth;
 mod balance;
 mod codex_oauth;
@@ -36,6 +37,7 @@ mod usage;
 mod webdav_sync;
 mod workspace;
 
+pub use accio::*;
 pub use auth::*;
 pub use balance::*;
 pub use codex_oauth::*;

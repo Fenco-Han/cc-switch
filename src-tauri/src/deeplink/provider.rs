@@ -152,6 +152,7 @@ pub(crate) fn build_provider_from_request(
         AppType::OpenCode => build_opencode_settings(request),
         AppType::OpenClaw => build_additive_app_settings(request),
         AppType::Hermes => build_hermes_settings(request),
+        AppType::Accio => build_accio_settings(request),
     };
 
     // Build usage script configuration if provided
@@ -578,6 +579,32 @@ fn build_hermes_settings(request: &DeepLinkImportRequest) -> serde_json::Value {
             "models".to_string(),
             json!([{ "id": model, "name": model }]),
         );
+    }
+
+    json!(config)
+}
+
+/// Build the CC Switch-owned Accio provider fragment.
+///
+/// Accio itself does not expose a writable provider file. CC Switch persists this
+/// fragment in `~/.accio/cc-switch-providers.json`; the same fields are later
+/// available to the launcher/injection path.
+fn build_accio_settings(request: &DeepLinkImportRequest) -> serde_json::Value {
+    let endpoint = get_primary_endpoint(request);
+
+    let mut config = serde_json::Map::new();
+    if let Some(name) = request.name.as_deref().filter(|s| !s.is_empty()) {
+        config.insert("name".to_string(), json!(name));
+    }
+    if !endpoint.is_empty() {
+        config.insert("base_url".to_string(), json!(endpoint));
+    }
+    if let Some(api_key) = &request.api_key {
+        config.insert("api_key".to_string(), json!(api_key));
+    }
+    config.insert("api_format".to_string(), json!("openai_chat"));
+    if let Some(model) = &request.model {
+        config.insert("model".to_string(), json!(model));
     }
 
     json!(config)
