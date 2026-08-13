@@ -60,7 +60,7 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEzREE1N0ZCMzlFNURBMzkKUldRNTJ1VTUrMWZhb3p0RFZWZEpGbGc1c0pUSkxLa1JWSVlNbE9jNjFNRnJiZ3hpUjZMVDdHUmYK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI0RTk4MzJCMTFFMzJBMApSV1NnTWg2eE1waE9DK3lpMnZPallaSFRlSUNsMUZrKzd2ek9TY00yazYxU0RpTmR4Y1JyOVBodgo=",
       "endpoints": [
         "https://github.com/Fenco-Han/cc-switch/releases/latest/download/latest.json"
       ]
