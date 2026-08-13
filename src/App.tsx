@@ -192,6 +192,7 @@ function App() {
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [isLaunchingAccio, setIsLaunchingAccio] = useState(false);
+  const [confirmRestartAccio, setConfirmRestartAccio] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [mcpManagementBusy, setMcpManagementBusy] = useState(false);
   const [skillsManagementBusy, setSkillsManagementBusy] = useState(false);
@@ -673,33 +674,29 @@ function App() {
     }
   };
 
-  const handleLaunchAccio = async () => {
-    const provider = providers["deepseek"] ?? Object.values(providers)[0];
-    if (!provider) {
-      toast.error(
-        t("accio.launch.missingProvider", {
-          defaultValue: "请先添加并启用 DeepSeek 供应商",
-        }),
-      );
-      return;
-    }
-
+  const handleLaunchAccio = async (forceRestart = false) => {
     setIsLaunchingAccio(true);
     try {
-      const result = await providersApi.launchAccio(provider.id);
+      const result = await providersApi.launchAccio(forceRestart);
       toast.success(
         t("accio.launch.success", {
-          defaultValue: `Accio 已通过 ${result.model} 启动`,
+          defaultValue: forceRestart
+            ? `Accio 已重启，使用 ${result.model}`
+            : `Accio 已通过 ${result.model} 启动`,
           model: result.model,
         }),
       );
     } catch (error) {
-      const detail = extractErrorMessage(error);
-      toast.error(
-        t("accio.launch.failed", {
-          defaultValue: "启动 Accio 失败",
-        }) + (detail ? `: ${detail}` : ""),
-      );
+      const detail = extractErrorMessage(error) || "";
+      if (!forceRestart && detail.includes("accio_already_running")) {
+        setConfirmRestartAccio(true);
+      } else {
+        toast.error(
+          t("accio.launch.failed", {
+            defaultValue: "启动 Accio 失败",
+          }) + (detail ? `: ${detail}` : ""),
+        );
+      }
     } finally {
       setIsLaunchingAccio(false);
     }
@@ -1081,7 +1078,8 @@ function App() {
                       onRemoveFromConfig={
                         activeApp === "opencode" ||
                         activeApp === "openclaw" ||
-                        activeApp === "hermes"
+                        activeApp === "hermes" ||
+                        activeApp === "accio"
                           ? (provider) =>
                               setConfirmAction({ provider, action: "remove" })
                           : undefined
@@ -1684,7 +1682,7 @@ function App() {
                         size="icon"
                         className="ml-1 bg-amber-500 hover:bg-amber-600 text-white"
                         title={t("accio.launch.button", {
-                          defaultValue: "启动 Accio DeepSeek",
+                          defaultValue: "启动 Accio",
                         })}
                       >
                         {isLaunchingAccio ? (
@@ -1794,6 +1792,19 @@ function App() {
           })();
         }}
         onCancel={() => setLaunchDashboardOpen(false)}
+      />
+
+      <ConfirmDialog
+        isOpen={confirmRestartAccio}
+        title={t("accio.launch.restartTitle")}
+        message={t("accio.launch.restartMessage")}
+        confirmText={t("accio.launch.restartAction")}
+        variant="info"
+        onConfirm={() => {
+          setConfirmRestartAccio(false);
+          void handleLaunchAccio(true);
+        }}
+        onCancel={() => setConfirmRestartAccio(false)}
       />
 
       <DeepLinkImportDialog />

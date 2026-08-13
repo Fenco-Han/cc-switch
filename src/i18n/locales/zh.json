@@ -901,7 +901,6 @@
   "accio": {
     "form": {
       "baseUrl": "API 端点",
-      "apiFormat": "API 协议",
       "models": "模型配置",
       "addModel": "添加模型",
       "defaultModel": "默认模型",
@@ -910,13 +909,21 @@
       "removeModel": "移除模型",
       "reasoningEfforts": "思考等级",
       "defaultReasoningEffort": "默认思考等级",
-      "noModels": "暂无模型配置"
+      "contextWindow": "上下文窗口",
+      "noModels": "暂无模型配置",
+      "toggleModelDetails": "展开或收起模型详情",
+      "modelIdPlaceholder": "gpt-4o-mini",
+      "modelNamePlaceholder": "GPT-4o Mini",
+      "modelsHint": "填写 API Key 后可点击「获取模型列表」自动拉取模型；第一个模型会设为 Accio 默认模型。"
     },
     "launch": {
-      "button": "启动 Accio DeepSeek",
+      "button": "启动 Accio",
       "success": "Accio 已通过 {{model}} 启动",
       "failed": "启动 Accio 失败",
-      "missingProvider": "请先添加并启用 DeepSeek 供应商"
+      "missingProvider": "请先添加并启用供应商",
+      "restartTitle": "重启 Accio",
+      "restartMessage": "Accio 正在运行。是否终止当前实例并重新启动？",
+      "restartAction": "重启"
     }
   },
   "appSwitcher": {

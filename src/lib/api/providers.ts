@@ -230,8 +230,8 @@ export const providersApi = {
     return await invoke("get_accio_live_provider", { providerId: id });
   },
 
-  async launchAccio(providerId: string): Promise<AccioLaunchResult> {
-    return await invoke("launch_accio", { providerId });
+  async launchAccio(forceRestart = false): Promise<AccioLaunchResult> {
+    return await invoke("launch_accio", { forceRestart });
   },
 };
 

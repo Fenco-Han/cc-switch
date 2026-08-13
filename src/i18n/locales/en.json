@@ -901,7 +901,6 @@
   "accio": {
     "form": {
       "baseUrl": "API Endpoint",
-      "apiFormat": "API Protocol",
       "models": "Models",
       "addModel": "Add model",
       "defaultModel": "Default model",
@@ -910,13 +909,21 @@
       "removeModel": "Remove model",
       "reasoningEfforts": "Reasoning levels",
       "defaultReasoningEffort": "Default level",
-      "noModels": "No models configured"
+      "contextWindow": "Context window",
+      "noModels": "No models configured",
+      "toggleModelDetails": "Expand or collapse model details",
+      "modelIdPlaceholder": "gpt-4o-mini",
+      "modelNamePlaceholder": "GPT-4o Mini",
+      "modelsHint": "Fill in the API key, then use \"Fetch models\" to pull the model list. The first model becomes the Accio default."
     },
     "launch": {
-      "button": "Launch Accio DeepSeek",
+      "button": "Launch Accio",
       "success": "Accio launched with {{model}}",
       "failed": "Failed to launch Accio",
-      "missingProvider": "Add and enable a DeepSeek provider first"
+      "missingProvider": "Add and enable a provider first",
+      "restartTitle": "Restart Accio",
+      "restartMessage": "Accio is already running. Stop the current instance and restart it?",
+      "restartAction": "Restart"
     }
   },
   "appSwitcher": {

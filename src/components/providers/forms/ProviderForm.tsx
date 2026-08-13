@@ -2313,7 +2313,7 @@ function ProviderFormFull({
                       )
                     }
                     placeholder={t("accio.form.providerKeyPlaceholder", {
-                      defaultValue: "deepseek",
+                      defaultValue: "my-provider",
                     })}
                     disabled={
                       isProviderKeyLocked || isProviderKeyLockStateLoading
@@ -2632,8 +2632,6 @@ function ProviderFormFull({
               onBaseUrlChange={accioForm.handleAccioBaseUrlChange}
               apiKey={accioForm.accioApiKey}
               onApiKeyChange={accioForm.handleAccioApiKeyChange}
-              apiFormat={accioForm.accioApiFormat}
-              onApiFormatChange={accioForm.handleAccioApiFormatChange}
               model={accioForm.accioModel}
               onModelChange={accioForm.handleAccioModelChange}
               models={accioForm.accioModels}
@@ -2746,11 +2744,11 @@ function ProviderFormFull({
                   placeholder={
                     appId === "accio"
                       ? `{
-  "name": "deepseek",
-  "base_url": "https://api.deepseek.com",
+  "name": "my-provider",
+  "base_url": "https://api.example.com/v1",
   "api_key": "",
   "api_format": "openai_chat",
-  "model": "deepseek-chat"
+  "model": "gpt-4o-mini"
 }`
                       : appId === "hermes"
                         ? `{

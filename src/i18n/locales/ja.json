@@ -901,7 +901,6 @@
   "accio": {
     "form": {
       "baseUrl": "API エンドポイント",
-      "apiFormat": "API プロトコル",
       "models": "モデル設定",
       "addModel": "モデルを追加",
       "defaultModel": "デフォルトモデル",
@@ -910,13 +909,21 @@
       "removeModel": "モデルを削除",
       "reasoningEfforts": "推論レベル",
       "defaultReasoningEffort": "デフォルトレベル",
-      "noModels": "モデルがありません"
+      "contextWindow": "コンテキストウィンドウ",
+      "noModels": "モデルがありません",
+      "toggleModelDetails": "モデル詳細を展開または折りたたむ",
+      "modelIdPlaceholder": "gpt-4o-mini",
+      "modelNamePlaceholder": "GPT-4o Mini",
+      "modelsHint": "API キーを入力後「モデルを取得」でモデル一覧を取得できます。最初のモデルが Accio のデフォルトになります。"
     },
     "launch": {
-      "button": "Accio DeepSeek を起動",
+      "button": "Accio を起動",
       "success": "Accio を {{model}} で起動しました",
       "failed": "Accio の起動に失敗しました",
-      "missingProvider": "DeepSeek プロバイダーを追加して有効化してください"
+      "missingProvider": "プロバイダーを追加して有効化してください",
+      "restartTitle": "Accio を再起動",
+      "restartMessage": "Accio は既に実行中です。現在のインスタンスを終了して再起動しますか？",
+      "restartAction": "再起動"
     }
   },
   "appSwitcher": {

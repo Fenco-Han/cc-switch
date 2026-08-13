@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 
 use super::{server::ProxyState, ProxyError};
 
-const ACCIO_DEFAULT_CONTEXT_WINDOW: u64 = 65_536;
+const ACCIO_DEFAULT_CONTEXT_WINDOW: u64 = 131_072;
 const ACCIO_DEEPSEEK_V4_LEGACY_CONTEXT_WINDOW: u64 = 131_072;
 const ACCIO_DEEPSEEK_V4_CONTEXT_WINDOW: u64 = 1_000_000;
 const ACCIO_OFFICIAL_GATEWAY: &str = "https://phoenix-gw.alibaba.com";
@@ -274,7 +274,7 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
                 continue;
             }
 
-            if let Some(call) = part.get("functionCall") {
+            if let Some(call) = part.get("functionCall").or_else(|| part.get("function_call")) {
                 let id = request_text(call.get("id"));
                 let name = request_text(call.get("name"));
                 let arguments = call
@@ -304,7 +304,10 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
                 continue;
             }
 
-            if let Some(response) = part.get("functionResponse") {
+            if let Some(response) = part
+                .get("functionResponse")
+                .or_else(|| part.get("function_response"))
+            {
                 let id = request_text(response.get("id"));
                 let content = response
                     .get("responseJson")
@@ -488,9 +491,12 @@ struct OpenAiToolCall {
 
 fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
+        let start = std::time::Instant::now();
+        let mut reasoning_chars = 0usize;
         let mut stream = upstream.bytes_stream();
         let mut buffer = String::new();
         let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
+        let mut reasoning_buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -519,16 +525,29 @@ fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, s
                 let mut parts = Vec::new();
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                     if !text.is_empty() {
+                        if !reasoning_buffer.is_empty() {
+                            parts.push(json!({
+                                "thought": true,
+                                "text": std::mem::take(&mut reasoning_buffer),
+                            }));
+                        }
                         parts.push(json!({ "text": text }));
                     }
                 }
                 if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                     if !reasoning.is_empty() {
-                        parts.push(json!({ "thought": true, "text": reasoning }));
+                        reasoning_chars += reasoning.chars().count();
+                        reasoning_buffer.push_str(reasoning);
                     }
                 }
 
                 if let Some(raw_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    if !raw_tool_calls.is_empty() && !reasoning_buffer.is_empty() {
+                        parts.push(json!({
+                            "thought": true,
+                            "text": std::mem::take(&mut reasoning_buffer),
+                        }));
+                    }
                     for raw_call in raw_tool_calls {
                         let index = raw_call
                             .get("index")
@@ -550,10 +569,22 @@ fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, s
                 }
 
                 if finish_reason.is_some() {
+                    if !reasoning_buffer.is_empty() {
+                        parts.push(json!({
+                            "thought": true,
+                            "text": std::mem::take(&mut reasoning_buffer),
+                        }));
+                    }
                     let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
                     ordered_indices.sort_unstable();
                     for index in ordered_indices {
                         let call = &tool_calls[&index];
+                        log::info!(
+                            "[Accio] emit functionCall id={} name={} args={}",
+                            call.id,
+                            call.name,
+                            call.arguments
+                        );
                         parts.push(json!({
                             "functionCall": {
                                 "id": call.id,
@@ -572,6 +603,13 @@ fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, s
             }
         }
 
+        if !reasoning_buffer.is_empty() {
+            yield Ok(sse_block(&adk_frame(
+                vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
+                None,
+                None,
+            )));
+        }
         if !tool_calls.is_empty() {
             let mut parts = Vec::new();
             let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
@@ -588,6 +626,10 @@ fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, s
             }
             yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
         }
+        log::info!(
+            "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
+            start.elapsed()
+        );
         yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
     }
 }
@@ -603,7 +645,42 @@ pub async fn handle_adk_llm(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|error| ProxyError::InvalidRequest(format!("invalid Accio ADK JSON: {error}")))?;
 
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        log::info!("[Accio] request tools={}", tools.len());
+    }
+    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
+        let mut part_keys = std::collections::HashSet::new();
+        let mut fc = 0usize;
+        let mut fr = 0usize;
+        for content in contents {
+            if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+                for part in parts {
+                    if let Some(obj) = part.as_object() {
+                        for key in obj.keys() {
+                            part_keys.insert(key.clone());
+                        }
+                    }
+                    if part.get("functionCall").is_some() {
+                        fc += 1;
+                    }
+                    if part.get("functionResponse").is_some() {
+                        fr += 1;
+                    }
+                }
+            }
+        }
+        log::info!(
+            "[Accio] request part_keys={:?} functionCall={fc} functionResponse={fr}",
+            part_keys
+        );
+    }
+
     let provider = select_accio_provider(&state, &body)?;
+    log::info!(
+        "[Accio] provider={} request_model={}",
+        request_text(provider.get("name")),
+        request_text(body.get("model")),
+    );
     let base_url = provider_base_url(&provider);
     if base_url.is_empty() {
         return Err(ProxyError::ConfigError(
@@ -618,20 +695,39 @@ pub async fn handle_adk_llm(
         format!("{base_url}/chat/completions")
     };
 
-    let mut request_builder = super::http_client::get()
-        .post(&upstream_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "text/event-stream")
-        .header(header::ACCEPT_ENCODING, "identity")
-        .body(build_openai_request_body(&body, &provider).to_string());
-    if !api_key.is_empty() {
-        request_builder = request_builder.bearer_auth(api_key);
-    }
+    let openai_body = build_openai_request_body(&body, &provider);
 
-    let upstream = request_builder
-        .send()
-        .await
-        .map_err(|error| ProxyError::ForwardFailed(error.to_string()))?;
+    // Nvidia 等免费端点会按请求频率限流（429）。多轮对话会连续发多个
+    // 请求，容易撞上限流窗口，这里对 429 做一次退避重试。
+    let mut attempt = 0u32;
+    let upstream = loop {
+        attempt += 1;
+        let mut request_builder = super::http_client::get()
+            .post(&upstream_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/event-stream")
+            .header(header::ACCEPT_ENCODING, "identity")
+            .body(openai_body.to_string());
+        if !api_key.is_empty() {
+            request_builder = request_builder.bearer_auth(api_key.as_str());
+        }
+
+        let upstream = request_builder
+            .send()
+            .await
+            .map_err(|error| ProxyError::ForwardFailed(error.to_string()))?;
+        let status = upstream.status();
+        log::info!("[Accio] upstream status={status} url={upstream_url}");
+        if status == StatusCode::TOO_MANY_REQUESTS && attempt < 2 {
+            log::warn!(
+                "[Accio] upstream 429 rate-limited, retrying in 10s (attempt {attempt})"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            continue;
+        }
+        break upstream;
+    };
+
     let status = upstream.status();
     if !status.is_success() {
         let text = upstream.text().await.unwrap_or_default();

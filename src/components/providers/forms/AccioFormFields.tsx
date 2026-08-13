@@ -1,6 +1,7 @@
-import { useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Plus, Trash2 } from "lucide-react";
+import { ChevronRight, Download, Loader2, Plus, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -14,20 +15,22 @@ import {
 } from "@/components/ui/select";
 import {
   ACCIO_REASONING_EFFORTS,
-  type AccioApiFormat,
   type AccioModelConfig,
   type AccioReasoningEffort,
 } from "@/config/accioProviderPresets";
 import type { ProviderCategory } from "@/types";
-import { ApiKeySection } from "./shared";
+import {
+  fetchModelsForConfig,
+  showFetchModelsError,
+  type FetchedModel,
+} from "@/lib/api/model-fetch";
+import { ApiKeySection, ModelDropdown } from "./shared";
 
 interface AccioFormFieldsProps {
   baseUrl: string;
   onBaseUrlChange: (value: string) => void;
   apiKey: string;
   onApiKeyChange: (value: string) => void;
-  apiFormat: AccioApiFormat;
-  onApiFormatChange: (value: AccioApiFormat) => void;
   model: string;
   onModelChange: (value: string) => void;
   models: AccioModelConfig[];
@@ -48,8 +51,6 @@ export function AccioFormFields({
   onBaseUrlChange,
   apiKey,
   onApiKeyChange,
-  apiFormat,
-  onApiFormatChange,
   model,
   onModelChange,
   models,
@@ -60,6 +61,11 @@ export function AccioFormFields({
 }: AccioFormFieldsProps) {
   const { t } = useTranslation();
   const modelKeysRef = useRef<string[]>([]);
+  const [expandedModelKeys, setExpandedModelKeys] = useState<Set<string>>(
+    new Set(),
+  );
+  const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
 
   while (modelKeysRef.current.length < models.length) {
     modelKeysRef.current.push(crypto.randomUUID());
@@ -67,25 +73,24 @@ export function AccioFormFields({
   if (modelKeysRef.current.length > models.length) {
     modelKeysRef.current.length = models.length;
   }
+  const modelKeys = modelKeysRef.current;
 
   const addModel = () => {
     modelKeysRef.current.push(crypto.randomUUID());
-    onModelsChange([
-      ...models,
-      {
-        id: "",
-        name: "",
-        reasoning_efforts: [],
-        context_window: 65_536,
-      },
-    ]);
+    onModelsChange([...models, { id: "", name: "" }]);
   };
 
   const removeModel = (index: number) => {
+    const removedKey = modelKeysRef.current[index];
     modelKeysRef.current.splice(index, 1);
     const next = [...models];
     next.splice(index, 1);
     onModelsChange(next);
+    setExpandedModelKeys((current) => {
+      const updated = new Set(current);
+      updated.delete(removedKey);
+      return updated;
+    });
   };
 
   const updateModel = (index: number, patch: Partial<AccioModelConfig>) => {
@@ -118,6 +123,42 @@ export function AccioFormFields({
     });
   };
 
+  const toggleModelDetails = (modelKey: string) => {
+    setExpandedModelKeys((current) => {
+      const next = new Set(current);
+      if (next.has(modelKey)) next.delete(modelKey);
+      else next.add(modelKey);
+      return next;
+    });
+  };
+
+  const handleFetchModels = useCallback(() => {
+    if (!baseUrl || !apiKey) {
+      showFetchModelsError(null, t, {
+        hasApiKey: !!apiKey,
+        hasBaseUrl: !!baseUrl,
+      });
+      return;
+    }
+    setIsFetchingModels(true);
+    fetchModelsForConfig(baseUrl, apiKey)
+      .then((fetched) => {
+        setFetchedModels(fetched);
+        if (fetched.length === 0) {
+          toast.info(t("providerForm.fetchModelsEmpty"));
+        } else {
+          toast.success(
+            t("providerForm.fetchModelsSuccess", { count: fetched.length }),
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn("[ModelFetch] Failed:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => setIsFetchingModels(false));
+  }, [baseUrl, apiKey, t]);
+
   return (
     <>
       <div className="space-y-2">
@@ -128,7 +169,7 @@ export function AccioFormFields({
           id="accio-base-url"
           value={baseUrl}
           onChange={(event) => onBaseUrlChange(event.target.value)}
-          placeholder="https://api.deepseek.com"
+          placeholder="https://api.example.com/v1"
           autoComplete="off"
         />
       </div>
@@ -142,36 +183,38 @@ export function AccioFormFields({
         websiteUrl={websiteUrl}
       />
 
-      <div className="space-y-2">
-        <FormLabel htmlFor="accio-api-format">
-          {t("accio.form.apiFormat", { defaultValue: "API Protocol" })}
-        </FormLabel>
-        <Select value={apiFormat} onValueChange={onApiFormatChange}>
-          <SelectTrigger id="accio-api-format">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="openai_chat">OpenAI Chat</SelectItem>
-            <SelectItem value="adk">Aliyun ADK</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-
       <div className="space-y-3 border-l border-border-default pl-3">
-        <div className="flex items-center justify-between gap-3">
-          <FormLabel>
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-normal leading-5">
             {t("accio.form.models", { defaultValue: "模型配置" })}
-          </FormLabel>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={addModel}
-            className="h-7 gap-1"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            {t("accio.form.addModel", { defaultValue: "添加模型" })}
-          </Button>
+          </h3>
+          <div className="flex gap-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleFetchModels}
+              disabled={isFetchingModels}
+              className="h-7 gap-1"
+            >
+              {isFetchingModels ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              {t("providerForm.fetchModels")}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={addModel}
+              className="h-7 gap-1"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              {t("accio.form.addModel", { defaultValue: "添加模型" })}
+            </Button>
+          </div>
         </div>
 
         <div className="space-y-2">
@@ -206,47 +249,78 @@ export function AccioFormFields({
           </p>
         ) : (
           <div className="space-y-2">
+            <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
+              <span className="w-9" />
+              <span className="flex-1">
+                {t("accio.form.modelId", { defaultValue: "模型 ID" })}
+              </span>
+              <span className="flex-1">
+                {t("accio.form.modelName", { defaultValue: "显示名称" })}
+              </span>
+              <span className="w-9" />
+            </div>
             {models.map((item, index) => {
-              const key = modelKeysRef.current[index];
+              const modelKey = modelKeys[index];
+              const isExpanded = expandedModelKeys.has(modelKey);
+              const detailsId = `accio-model-details-${modelKey}`;
               const efforts = item.reasoning_efforts ?? [];
               return (
-                <div
-                  key={key}
-                  className="space-y-3 rounded-md border border-border p-3"
-                >
-                  <div className="grid grid-cols-[1fr_1fr_auto] items-start gap-2">
-                    <div className="space-y-1 min-w-0">
-                      <FormLabel htmlFor={`accio-model-id-${key}`}>
-                        {t("accio.form.modelId", { defaultValue: "模型 ID" })}
-                      </FormLabel>
+                <div key={modelKey} className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => toggleModelDetails(modelKey)}
+                      aria-label={t("accio.form.toggleModelDetails", {
+                        defaultValue: "展开或收起模型详情",
+                      })}
+                      aria-expanded={isExpanded}
+                      aria-controls={detailsId}
+                      className="h-9 w-9 shrink-0"
+                    >
+                      <ChevronRight
+                        className={`h-4 w-4 transition-transform motion-reduce:transition-none ${
+                          isExpanded ? "rotate-90" : ""
+                        }`}
+                      />
+                    </Button>
+                    <div className="flex min-w-0 flex-1 items-center gap-1">
                       <Input
-                        id={`accio-model-id-${key}`}
+                        id={`accio-model-id-${modelKey}`}
                         value={item.id}
-                        onChange={(event) =>
-                          updateModel(index, {
-                            id: event.target.value.trim(),
-                          })
+                        onChange={(e) =>
+                          updateModel(index, { id: e.target.value.trim() })
                         }
-                        placeholder="deepseek-v4-flash"
-                        className="h-8"
-                      />
-                    </div>
-                    <div className="space-y-1 min-w-0">
-                      <FormLabel htmlFor={`accio-model-name-${key}`}>
-                        {t("accio.form.modelName", {
-                          defaultValue: "显示名称",
+                        placeholder={t("accio.form.modelIdPlaceholder", {
+                          defaultValue: "gpt-4o-mini",
                         })}
-                      </FormLabel>
-                      <Input
-                        id={`accio-model-name-${key}`}
-                        value={item.name}
-                        onChange={(event) =>
-                          updateModel(index, { name: event.target.value })
-                        }
-                        placeholder="DeepSeek V4 Flash"
-                        className="h-8"
+                        aria-label={t("accio.form.modelId", {
+                          defaultValue: "模型 ID",
+                        })}
+                        className="min-w-0 flex-1"
                       />
+                      {fetchedModels.length > 0 && (
+                        <ModelDropdown
+                          models={fetchedModels}
+                          onSelect={(id) => updateModel(index, { id })}
+                        />
+                      )}
                     </div>
+                    <Input
+                      id={`accio-model-name-${modelKey}`}
+                      value={item.name}
+                      onChange={(e) =>
+                        updateModel(index, { name: e.target.value })
+                      }
+                      placeholder={t("accio.form.modelNamePlaceholder", {
+                        defaultValue: "GPT-4o Mini",
+                      })}
+                      aria-label={t("accio.form.modelName", {
+                        defaultValue: "显示名称",
+                      })}
+                      className="min-w-0 flex-1"
+                    />
                     <Button
                       type="button"
                       variant="ghost"
@@ -255,78 +329,121 @@ export function AccioFormFields({
                       aria-label={t("accio.form.removeModel", {
                         defaultValue: "移除模型",
                       })}
-                      className="mt-5 h-8 w-8 text-muted-foreground"
+                      className="h-9 w-9 shrink-0 text-muted-foreground hover:text-destructive"
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </div>
 
-                  <div className="grid gap-3 lg:grid-cols-[1fr_160px]">
-                    <div className="space-y-1.5">
-                      <FormLabel>
-                        {t("accio.form.reasoningEfforts", {
-                          defaultValue: "思考等级",
-                        })}
-                      </FormLabel>
-                      <div className="flex flex-wrap gap-4">
-                        {ACCIO_REASONING_EFFORTS.map((effort) => {
-                          const checked = efforts.includes(effort);
-                          return (
-                            <label
-                              key={effort}
-                              className="flex items-center gap-1.5 text-sm"
-                            >
-                              <Checkbox
-                                checked={checked}
-                                onCheckedChange={(value) =>
-                                  toggleReasoningEffort(
-                                    index,
-                                    effort,
-                                    value === true,
-                                  )
-                                }
-                              />
-                              <span className="capitalize">{effort}</span>
-                            </label>
-                          );
-                        })}
+                  {isExpanded && (
+                    <div
+                      id={detailsId}
+                      className="ml-9 space-y-3 border-l border-border-default pl-4"
+                    >
+                      <div className="space-y-1.5">
+                        <FormLabel htmlFor={`accio-model-context-${modelKey}`}>
+                          {t("accio.form.contextWindow", {
+                            defaultValue: "上下文窗口",
+                          })}
+                        </FormLabel>
+                        <Input
+                          id={`accio-model-context-${modelKey}`}
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={item.context_window ?? ""}
+                          onChange={(event) => {
+                            const value = event.target.value.replace(
+                              /[^\d]/g,
+                              "",
+                            );
+                            updateModel(index, {
+                              context_window: value
+                                ? parseInt(value, 10)
+                                : undefined,
+                            });
+                          }}
+                          placeholder="65536"
+                        />
+                      </div>
+
+                      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
+                        <div className="space-y-1.5">
+                          <FormLabel>
+                            {t("accio.form.reasoningEfforts", {
+                              defaultValue: "思考等级",
+                            })}
+                          </FormLabel>
+                          <div className="flex flex-wrap gap-4">
+                            {ACCIO_REASONING_EFFORTS.map((effort) => {
+                              const checked = efforts.includes(effort);
+                              return (
+                                <label
+                                  key={effort}
+                                  className="flex items-center gap-1.5 text-sm"
+                                >
+                                  <Checkbox
+                                    checked={checked}
+                                    onCheckedChange={(value) =>
+                                      toggleReasoningEffort(
+                                        index,
+                                        effort,
+                                        value === true,
+                                      )
+                                    }
+                                  />
+                                  <span className="capitalize">{effort}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <FormLabel
+                            htmlFor={`accio-default-effort-${modelKey}`}
+                          >
+                            {t("accio.form.defaultReasoningEffort", {
+                              defaultValue: "默认等级",
+                            })}
+                          </FormLabel>
+                          <Select
+                            value={item.default_reasoning_effort ?? ""}
+                            onValueChange={(value) =>
+                              updateModel(index, {
+                                default_reasoning_effort:
+                                  value as AccioReasoningEffort,
+                              })
+                            }
+                            disabled={efforts.length === 0}
+                          >
+                            <SelectTrigger id={`accio-default-effort-${modelKey}`}>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {efforts.map((effort) => (
+                                <SelectItem key={effort} value={effort}>
+                                  <span className="capitalize">{effort}</span>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
                       </div>
                     </div>
-
-                    <div className="space-y-1.5">
-                      <FormLabel htmlFor={`accio-default-effort-${key}`}>
-                        {t("accio.form.defaultReasoningEffort", {
-                          defaultValue: "默认等级",
-                        })}
-                      </FormLabel>
-                      <Select
-                        value={item.default_reasoning_effort ?? ""}
-                        onValueChange={(value) =>
-                          updateModel(index, {
-                            default_reasoning_effort:
-                              value as AccioReasoningEffort,
-                          })
-                        }
-                        disabled={efforts.length === 0}
-                      >
-                        <SelectTrigger id={`accio-default-effort-${key}`}>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {efforts.map((effort) => (
-                            <SelectItem key={effort} value={effort}>
-                              <span className="capitalize">{effort}</span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
+                  )}
                 </div>
               );
             })}
           </div>
         )}
+
+        <p className="text-xs text-muted-foreground">
+          {t("accio.form.modelsHint", {
+            defaultValue:
+              "填写 API Key 后可点击「获取模型列表」自动拉取模型；第一个模型会设为 Accio 默认模型。",
+          })}
+        </p>
       </div>
     </>
   );

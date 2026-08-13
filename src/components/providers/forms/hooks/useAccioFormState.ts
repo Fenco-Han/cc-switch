@@ -5,7 +5,6 @@ import {
   ACCIO_DEFAULT_API_FORMAT,
   ACCIO_DEEPSEEK_MODELS,
   ACCIO_REASONING_EFFORTS,
-  type AccioApiFormat,
   type AccioModelConfig,
   type AccioReasoningEffort,
   type AccioProviderSettingsConfig,
@@ -57,13 +56,11 @@ export interface AccioFormState {
   setAccioProviderKey: (key: string) => void;
   accioBaseUrl: string;
   accioApiKey: string;
-  accioApiFormat: AccioApiFormat;
   accioModel: string;
   accioModels: AccioModelConfig[];
   existingAccioKeys: string[];
   handleAccioBaseUrlChange: (baseUrl: string) => void;
   handleAccioApiKeyChange: (apiKey: string) => void;
-  handleAccioApiFormatChange: (apiFormat: AccioApiFormat) => void;
   handleAccioModelChange: (model: string) => void;
   handleAccioModelsChange: (models: AccioModelConfig[]) => void;
   resetAccioState: (config?: Partial<AccioProviderSettingsConfig>) => void;
@@ -177,14 +174,6 @@ export function useAccioFormState({
     if (appId !== "accio") return "";
     return parseAccioField(initialData, "api_key", "");
   });
-  const [accioApiFormat, setAccioApiFormat] = useState<AccioApiFormat>(() => {
-    if (appId !== "accio") return ACCIO_DEFAULT_API_FORMAT;
-    return parseAccioField<AccioApiFormat>(
-      initialData,
-      "api_format",
-      ACCIO_DEFAULT_API_FORMAT,
-    );
-  });
   const [accioModel, setAccioModel] = useState<string>(() => {
     if (appId !== "accio") return "";
     return parseAccioField(initialData, "model", "");
@@ -229,16 +218,6 @@ export function useAccioFormState({
     [updateAccioConfig],
   );
 
-  const handleAccioApiFormatChange = useCallback(
-    (apiFormat: AccioApiFormat) => {
-      setAccioApiFormat(apiFormat);
-      updateAccioConfig((config) => {
-        config.api_format = apiFormat;
-      });
-    },
-    [updateAccioConfig],
-  );
-
   const handleAccioModelChange = useCallback(
     (model: string) => {
       setAccioModel(model);
@@ -276,10 +255,9 @@ export function useAccioFormState({
   const resetAccioState = useCallback(
     (config?: Partial<AccioProviderSettingsConfig>) => {
       const models = normalizeAccioModels(config);
-      setAccioProviderKey("");
+      setAccioProviderKey(config?.name || "");
       setAccioBaseUrl(config?.base_url || "");
       setAccioApiKey(config?.api_key || "");
-      setAccioApiFormat(config?.api_format ?? ACCIO_DEFAULT_API_FORMAT);
       setAccioModels(models);
       setAccioModel(config?.model || models[0]?.id || "");
     },
@@ -291,13 +269,11 @@ export function useAccioFormState({
     setAccioProviderKey,
     accioBaseUrl,
     accioApiKey,
-    accioApiFormat,
     accioModel,
     accioModels,
     existingAccioKeys,
     handleAccioBaseUrlChange,
     handleAccioApiKeyChange,
-    handleAccioApiFormatChange,
     handleAccioModelChange,
     handleAccioModelsChange,
     resetAccioState,

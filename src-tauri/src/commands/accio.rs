@@ -40,10 +40,24 @@ fn accio_is_running() -> bool {
         .unwrap_or(false)
 }
 
+fn kill_accio() -> Result<(), String> {
+    let output = Command::new("pkill")
+        .args(["-f", "/Applications/Accio.app/Contents/MacOS/Accio"])
+        .output()
+        .map_err(|error| format!("终止 Accio 失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "终止 Accio 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn launch_accio(
     state: State<'_, AppState>,
-    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] forceRestart: Option<bool>,
 ) -> Result<AccioLaunchResult, String> {
     if !std::path::Path::new(accio_app_path()).exists() {
         return Err("未找到 /Applications/Accio.app".to_string());
@@ -51,21 +65,42 @@ pub async fn launch_accio(
     if !cfg!(target_os = "macos") {
         return Err("当前版本的 Accio 启动器仅支持 macOS".to_string());
     }
-    if accio_is_running() {
-        return Err("Accio 正在运行，请先退出后再由 CC Switch 启动".to_string());
+    let running = accio_is_running();
+    if running && !forceRestart.unwrap_or(false) {
+        return Err("accio_already_running".to_string());
+    }
+    if running {
+        kill_accio()?;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
 
-    let provider = accio_config::get_provider(&providerId)
-        .map_err(|error| error.to_string())?
-        .or_else(|| {
-            state
-                .db
-                .get_provider_by_id(&providerId, "accio")
-                .ok()
-                .flatten()
-                .map(|provider| provider.settings_config)
-        })
-        .ok_or_else(|| format!("Accio 供应商 '{providerId}' 不存在"))?;
+    // 以「已添加」的供应商为准：从 live 配置读取全部供应商，
+    // 取第一个作为 Accio 启动时的默认模型；完整模型目录由
+    // `/accio/api/llm/config/v2` 一次性注入所有供应商的模型。
+    let providers = accio_config::get_providers().map_err(|error| error.to_string())?;
+    let provider = if providers.is_empty() {
+        state
+            .db
+            .get_all_providers("accio")
+            .map_err(|error| error.to_string())?
+            .into_values()
+            .next()
+            .map(|provider| provider.settings_config)
+            .ok_or_else(|| "未配置 Accio 供应商".to_string())?
+    } else {
+        providers
+            .values()
+            .next()
+            .cloned()
+            .ok_or_else(|| "未配置 Accio 供应商".to_string())?
+    };
+
+    let provider_id = provider
+        .get("name")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
     let model = provider
         .get("model")
         .and_then(|value| value.as_str())
@@ -80,7 +115,7 @@ pub async fn launch_accio(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| providerId.clone());
+        .unwrap_or_else(|| provider_id.clone());
 
     let proxy = state
         .proxy_service
@@ -94,7 +129,7 @@ pub async fn launch_accio(
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| providerId.clone());
+        .unwrap_or_else(|| provider_id.clone());
 
     let output = Command::new("/usr/bin/open")
         .arg("-n")
@@ -123,7 +158,7 @@ pub async fn launch_accio(
     }
 
     Ok(AccioLaunchResult {
-        provider_id: providerId,
+        provider_id: provider_id.clone(),
         model,
         gateway_base_url,
         adk_base_url,
