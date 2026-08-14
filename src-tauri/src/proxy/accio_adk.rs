@@ -9,7 +9,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
@@ -30,6 +30,103 @@ fn request_text(value: Option<&Value>) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// 把上游(海康 MaaS 等)的错误响应翻译成对 Accio 友好的中文错误 body。
+///
+/// 海康返回的错误体结构多样(OpenAI 风格 `{"error":{"message":...}}` 或
+/// `{"detail":{"error":{"message":...}}}`)，Accio 前端往往只显示到状态码
+/// 就丢了详情(例如只显示「网络请求失败 (400)」)。这里先把原始 message 提取
+/// 出来，再根据【原始错误内容 + 状态码】映射成清晰的中文说明，统一回成标准的
+/// OpenAI 错误结构 `{"error":{"message":...,"type":"upstream_error","code":...}}`，
+/// 让 Accio 页面能把原因真正展示出来。
+///
+/// `hint` 是 Accio 侧生成的额外提示(如请求上下文太大)，优先拼在最前。
+fn upstream_error_body(status: u16, body_text: &str, hint: &str) -> Value {
+    // 从上游 body 里提取原始错误 message(兼容 OpenAI 与海康 detail 两种结构)。
+    let mut raw_message = String::new();
+    if let Ok(value) = serde_json::from_str::<Value>(body_text) {
+        if let Some(msg) = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            raw_message = msg;
+        } else if let Some(msg) = value
+            .pointer("/detail/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            raw_message = msg;
+        }
+    }
+    if raw_message.is_empty() && !body_text.trim().is_empty() {
+        raw_message = body_text.trim().to_string();
+    }
+
+    let friendly = friendly_accio_error(status, &raw_message);
+
+    // 把原始信息也带上，方便排障；hint 放最前，让 Accio 先看到结论。
+    let mut message = String::new();
+    if !hint.is_empty() {
+        message.push_str(hint);
+        message.push_str("。");
+    }
+    message.push_str(&friendly);
+    if !raw_message.is_empty() {
+        message.push_str(&format!("（原始信息: {raw_message}）"));
+    }
+
+    json!({
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": status,
+        }
+    })
+}
+
+/// 状态码 + 原始错误内容 → 友好中文错误描述(优先精确匹配原始内容)。
+fn friendly_accio_error(status: u16, raw: &str) -> String {
+    let raw_lower = raw.to_ascii_lowercase();
+    // 按原始错误内容精确/关键词匹配(优先于状态码，因为同一状态码多种含义)。
+    let by_message = [
+        ("bad request", "请求无效"),
+        ("parameter invalid", "参数错误"),
+        ("api key is invalid", "API-KEY 无效，请联系空间管理员确认后修改"),
+        ("request invalid", "请求校验失败"),
+        ("forbidden", "请求拒绝，服务限流"),
+        ("model service request has reached the limit", "模型服务请求已到上限"),
+        ("the api-key does not match the workspace", "apikey 以及用户关联的工作空间不匹配"),
+        ("not found", "请求的资源不存在"),
+        ("too many requests", "请求过于频繁"),
+        ("internal server error", "服务器内部错误"),
+        ("redis read or write failure", "redis 读写失败"),
+        ("internal error", "内部错误"),
+        ("knowledge not be authorized", "知识库未授权操作，该操作仅创建人可执行"),
+        ("maas-web-config service is incorrect", "maas-web-config 服务不正确"),
+        ("maas-knowledge-manage service is incorrect", "maas-knowledge-manage 服务不正确"),
+        ("no deployments available", "所选模型当前没有可用部署，请稍后重试"),
+    ];
+    for (key, zh) in by_message {
+        if raw_lower.contains(key) {
+            return zh.to_string();
+        }
+    }
+
+    // 未匹配到内容则退化为按状态码的通用中文。
+    match status {
+        400 => "请求无效".to_string(),
+        401 => "认证失败，请检查 API-KEY".to_string(),
+        403 => "请求拒绝，服务限流（模型服务访问已超承载上限，请稍后重试）".to_string(),
+        404 => "请求的资源不存在".to_string(),
+        429 => "请求过于频繁（模型服务访问已超承载上限，请稍后重试）".to_string(),
+        500 => "服务器内部错误（系统出现异常，请联系技术支持）".to_string(),
+        502 => "上游网关错误".to_string(),
+        503 => "上游服务不可用".to_string(),
+        504 => "上游网关超时".to_string(),
+        _ => format!("上游服务错误（HTTP {status}）"),
+    }
 }
 
 fn deepseek_models() -> Vec<Value> {
@@ -225,14 +322,22 @@ fn role_for_openai(role: &str) -> &'static str {
     }
 }
 
-fn tool_response_content(response_json: &str) -> Value {
+/// 把工具返回的 responseJson（一般是 JSON 字符串）转成海康能接受的字符串 content。
+/// 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串；不能是 JSON 对象。
+/// 若解析出的是对象/数组，则整体序列化为紧凑 JSON 字符串下发。
+fn serialize_tool_response_content(response_json: &str) -> Value {
     match serde_json::from_str::<Value>(response_json) {
-        Ok(value) => value
-            .get("content")
-            .or_else(|| value.get("response"))
-            .cloned()
-            .unwrap_or(value),
+        Ok(Value::String(s)) => Value::String(s),
+        Ok(value) => serialize_json_value_to_string(&value),
         Err(_) => Value::String(response_json.to_string()),
+    }
+}
+
+/// 把任意 JSON Value 序列化为字符串（对象/数组/数字/布尔都转字符串）。
+fn serialize_json_value_to_string(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(s.clone()),
+        other => Value::String(other.to_string()),
     }
 }
 
@@ -309,12 +414,22 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
                 .or_else(|| part.get("function_response"))
             {
                 let id = request_text(response.get("id"));
+                // 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串。
+                // 若工具返回的是结构化 JSON 对象，将其序列化为字符串再下发，
+                // 否则海康会以 400 Bad Request 拒绝（"Input should be a valid dictionary / string"）。
                 let content = response
                     .get("responseJson")
                     .or_else(|| response.get("response_json"))
                     .and_then(Value::as_str)
-                    .map(tool_response_content)
-                    .unwrap_or_else(|| response.get("response").cloned().unwrap_or(Value::Null));
+                    .map(serialize_tool_response_content)
+                    .or_else(|| {
+                        if let Some(value) = response.get("response") {
+                            Some(serialize_json_value_to_string(value))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| Value::Null);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": if id.is_empty() { format!("call_{}", messages.len()) } else { id },
@@ -731,10 +846,13 @@ pub async fn handle_adk_llm(
     let status = upstream.status();
     if !status.is_success() {
         let text = upstream.text().await.unwrap_or_default();
-        return Err(ProxyError::UpstreamError {
-            status: status.as_u16(),
-            body: Some(text),
-        });
+        // 把上游错误翻译成 Accio 能展示的中文错误体返回，而不是只透传原始 body
+        // (原始 body 是海康的 detail 结构，Accio 前端往往只显示到状态码就丢了详情)。
+        log::error!(
+            "[Accio] upstream status={status} url={upstream_url} body={text}"
+        );
+        let error_body = upstream_error_body(status.as_u16(), &text, "");
+        return Ok((status, Json(error_body)).into_response());
     }
 
     let stream = adk_stream(upstream);
