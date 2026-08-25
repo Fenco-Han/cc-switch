@@ -341,6 +341,47 @@ fn serialize_json_value_to_string(value: &Value) -> Value {
     }
 }
 
+/// 把一个 ADK `functionResponse` part 转成 OpenAI `role:"tool"` 消息并压入 messages。
+///
+/// Accio/ADK 并不保证 functionResponse 一定放在 `role:"tool"` 的 content 里——
+/// 实测它可能和 functionCall 一起放在同一个 `role:"model"` content 中，也可能
+/// 单独出现在 model/user content 里。因此转换时不能按 content 角色过滤，必须在
+/// 任意位置识别 functionResponse 并生成 tool 消息，否则 assistant 的 tool_calls
+/// 后面没有对应的 tool 消息，DeepSeek 会返回 400
+/// 「An assistant message with 'tool_calls' must be followed by tool messages...」。
+fn push_tool_response(
+    messages: &mut Vec<Value>,
+    response: &Value,
+    tool_call_counter: &mut usize,
+) {
+    let id = request_text(response.get("id"));
+    // 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串。
+    // 若工具返回的是结构化 JSON 对象，将其序列化为字符串再下发，
+    // 否则海康会以 400 Bad Request 拒绝。
+    let content = response
+        .get("responseJson")
+        .or_else(|| response.get("response_json"))
+        .and_then(Value::as_str)
+        .map(serialize_tool_response_content)
+        .or_else(|| {
+            if let Some(value) = response.get("response") {
+                Some(serialize_json_value_to_string(value))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| Value::Null);
+    messages.push(json!({
+        "role": "tool",
+        "tool_call_id": if id.is_empty() {
+            format!("call_{tool_call_counter}")
+        } else {
+            id
+        },
+        "content": content,
+    }));
+}
+
 fn convert_accio_contents(body: &Value) -> Vec<Value> {
     let mut messages = Vec::new();
 
@@ -426,6 +467,24 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
         if role == "assistant" {
             // 累积 assistant 回合：thought / text / functionCall 合并。
             for part in parts {
+                // functionResponse 可能与 functionCall 同在一个 model content
+                // 里（Accio 实测如此）：先把已累积的 assistant（含 tool_calls）
+                // 刷出，再补对应的 tool 消息，保证 DeepSeek 收到
+                // assistant(tool_calls) → tool 的正确序列。
+                if let Some(response) = part
+                    .get("functionResponse")
+                    .or_else(|| part.get("function_response"))
+                {
+                    flush_assistant(
+                        &mut messages,
+                        &mut pending_reasoning,
+                        &mut pending_text,
+                        &mut pending_tool_calls,
+                    );
+                    push_tool_response(&mut messages, response, &mut tool_call_counter);
+                    continue;
+                }
+
                 let is_thought = part
                     .get("thought")
                     .map(|v| v.as_bool().unwrap_or(false))
@@ -483,9 +542,6 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
                     }));
                     continue;
                 }
-
-                // assistant content 里的其它 part（如 functionResponse）
-                // 由恰当的独立 content（role="tool"）处理，这里忽略。
             }
             continue;
         }
@@ -499,39 +555,16 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
         );
 
         for part in parts {
-            if role == "tool" {
-                if let Some(response) = part
-                    .get("functionResponse")
-                    .or_else(|| part.get("function_response"))
-                {
-                    let id = request_text(response.get("id"));
-                    // 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串。
-                    // 若工具返回的是结构化 JSON 对象，将其序列化为字符串再下发，
-                    // 否则海康会以 400 Bad Request 拒绝。
-                    let content = response
-                        .get("responseJson")
-                        .or_else(|| response.get("response_json"))
-                        .and_then(Value::as_str)
-                        .map(serialize_tool_response_content)
-                        .or_else(|| {
-                            if let Some(value) = response.get("response") {
-                                Some(serialize_json_value_to_string(value))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| Value::Null);
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": if id.is_empty() {
-                            format!("call_{tool_call_counter}")
-                        } else {
-                            id
-                        },
-                        "content": content,
-                    }));
-                }
-            } else if let Some(text) = part.get("text").and_then(Value::as_str) {
+            // functionResponse 也可能出现在 role="user"/"tool" 的 content 里
+            //（Gemini 风格），统一在此识别并转成 tool 消息。
+            if let Some(response) = part
+                .get("functionResponse")
+                .or_else(|| part.get("function_response"))
+            {
+                push_tool_response(&mut messages, response, &mut tool_call_counter);
+                continue;
+            }
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if !text.is_empty() {
                     messages.push(json!({ "role": role, "content": text }));
                 }
@@ -1001,6 +1034,47 @@ pub async fn handle_adk_llm(
         log::error!(
             "[Accio] upstream status={status} url={upstream_url} body={text}"
         );
+        // 排障辅助：把发往上游的 OpenAI 消息骨架打出来（role / tool_call ids /
+        // 是否带 reasoning_content / content 长度），400 一类的结构问题一眼可辨。
+        let skeleton: Vec<Value> = openai_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| {
+                        let tool_call_ids = message
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .map(|calls| {
+                                calls
+                                    .iter()
+                                    .filter_map(|call| {
+                                        call.get("id").and_then(Value::as_str)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        json!({
+                            "role": message.get("role"),
+                            "tool_call_ids": tool_call_ids,
+                            "tool_call_id": message.get("tool_call_id"),
+                            "has_reasoning_content": message
+                                .get("reasoning_content")
+                                .and_then(Value::as_str)
+                                .map(|value| !value.is_empty())
+                                .unwrap_or(false),
+                            "content_len": message
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(str::len)
+                                .unwrap_or(0),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        log::error!("[Accio] outgoing messages skeleton: {skeleton:?}");
         let error_body = upstream_error_body(status.as_u16(), &text, "");
         return Ok((status, Json(error_body)).into_response());
     }
@@ -1271,6 +1345,80 @@ mod tests {
         assert_eq!(messages[0]["reasoning_content"], "思考但无文本回复");
         assert_eq!(messages[0]["content"], serde_json::Value::Null);
         assert!(messages[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn function_response_in_same_model_content_follows_tool_calls() {
+        // Accio 实测会把 functionResponse 和 functionCall 放在同一个
+        // role="model" content 里。转换必须产出 assistant(tool_calls) →
+        // tool 消息，否则 DeepSeek 400「insufficient tool messages」。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "请分析热销数据"}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "先读取技能说明"},
+                    {"text": "我先读取技能说明。"},
+                    {"functionCall": {"id": "call_skill_1", "name": "skill", "args": "{\"action\":\"read\"}"}},
+                    {"functionResponse": {"id": "call_skill_1", "responseJson": "{\"content\":\"# 热销爆品洞察\"}"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "先读取技能说明");
+        assert_eq!(messages[1]["content"], "我先读取技能说明。");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_skill_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_skill_1");
+        assert_eq!(messages[2]["content"], "{\"content\":\"# 热销爆品洞察\"}");
+    }
+
+    #[test]
+    fn function_response_in_separate_model_content_is_kept() {
+        // functionResponse 单独出现在另一个 role="model" content 里同样要识别。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "need tool"},
+                    {"functionCall": {"id": "c1", "name": "read", "args": "{}"}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"id": "c1", "responseJson": "{\"ok\":true}"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "c1");
+        assert_eq!(messages[2]["content"], "{\"ok\":true}");
+    }
+
+    #[test]
+    fn function_response_in_user_content_is_kept() {
+        // Gemini 风格：functionResponse 也可能放在 role="user" content 里。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "c2", "name": "bash", "args": "{\"cmd\":\"ls\"}"}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"id": "c2", "responseJson": "file1"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "c2");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "c2");
+        assert_eq!(messages[2]["content"], "file1");
     }
 
     #[test]
