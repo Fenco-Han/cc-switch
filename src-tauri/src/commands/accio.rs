@@ -356,6 +356,10 @@ pub async fn launch_accio(
     log::info!(
         "[accio] launching provider_id={provider_id} model={model} gateway={gateway_base_url}"
     );
+    // 把 Accio 的子代理（skill-executor 等）默认模型一并改写为主会话模型，
+    // 让注入时子代理与主会话使用同一模型（尽力而为，失败不阻断启动；
+    // Accio 下次重新拉取官方策略前保持生效）。
+    accio_config::rewrite_subagent_model_routing(&model);
     let launch_result = launch_accio_process(&app_path, &envs);
     if let Err(e) = &launch_result {
         log::error!("[accio] launch_accio_process failed: {e}");

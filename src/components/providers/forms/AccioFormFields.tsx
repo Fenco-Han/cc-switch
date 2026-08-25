@@ -251,13 +251,18 @@ export function AccioFormFields({
           <div className="space-y-2">
             <div className="flex items-center gap-2 px-1 text-xs text-muted-foreground">
               <span className="w-9" />
-              <span className="flex-1">
+              <span className="flex min-w-0 flex-1">
                 {t("accio.form.modelId", { defaultValue: "模型 ID" })}
               </span>
-              <span className="flex-1">
+              <span className="flex min-w-0 flex-1">
                 {t("accio.form.modelName", { defaultValue: "显示名称" })}
               </span>
-              <span className="w-9" />
+              <span className="w-24 shrink-0">
+                {t("accio.form.contextWindow", {
+                  defaultValue: "上下文窗口",
+                })}
+              </span>
+              <span className="w-9 shrink-0" />
             </div>
             {models.map((item, index) => {
               const modelKey = modelKeys[index];
@@ -321,6 +326,32 @@ export function AccioFormFields({
                       })}
                       className="min-w-0 flex-1"
                     />
+                    <Input
+                      id={`accio-model-context-${modelKey}`}
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={item.context_window ?? ""}
+                      onChange={(event) => {
+                        const value = event.target.value.replace(
+                          /[^\d]/g,
+                          "",
+                        );
+                        updateModel(index, {
+                          context_window: value
+                            ? parseInt(value, 10)
+                            : undefined,
+                        });
+                      }}
+                      placeholder="65536"
+                      aria-label={t("accio.form.contextWindow", {
+                        defaultValue: "上下文窗口",
+                      })}
+                      title={t("accio.form.contextWindowPlaceholder", {
+                        defaultValue: "例如: 128000",
+                      })}
+                      className="w-24 shrink-0"
+                    />
                     <Button
                       type="button"
                       variant="ghost"
@@ -340,33 +371,6 @@ export function AccioFormFields({
                       id={detailsId}
                       className="ml-9 space-y-3 border-l border-border-default pl-4"
                     >
-                      <div className="space-y-1.5">
-                        <FormLabel htmlFor={`accio-model-context-${modelKey}`}>
-                          {t("accio.form.contextWindow", {
-                            defaultValue: "上下文窗口",
-                          })}
-                        </FormLabel>
-                        <Input
-                          id={`accio-model-context-${modelKey}`}
-                          type="text"
-                          inputMode="numeric"
-                          pattern="[0-9]*"
-                          value={item.context_window ?? ""}
-                          onChange={(event) => {
-                            const value = event.target.value.replace(
-                              /[^\d]/g,
-                              "",
-                            );
-                            updateModel(index, {
-                              context_window: value
-                                ? parseInt(value, 10)
-                                : undefined,
-                            });
-                          }}
-                          placeholder="65536"
-                        />
-                      </div>
-
                       <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
                         <div className="space-y-1.5">
                           <FormLabel>

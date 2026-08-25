@@ -910,6 +910,7 @@
       "reasoningEfforts": "Reasoning levels",
       "defaultReasoningEffort": "Default level",
       "contextWindow": "Context window",
+      "contextWindowPlaceholder": "e.g. 128000",
       "noModels": "No models configured",
       "toggleModelDetails": "Expand or collapse model details",
       "modelIdPlaceholder": "gpt-4o-mini",

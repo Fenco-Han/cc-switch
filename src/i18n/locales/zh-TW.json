@@ -911,6 +911,7 @@
       "reasoningEfforts": "思考等級",
       "defaultReasoningEffort": "預設思考等級",
       "contextWindow": "上下文視窗",
+      "contextWindowPlaceholder": "例如: 128000",
       "noModels": "尚無模型設定",
       "toggleModelDetails": "展開或收起模型詳情",
       "modelIdPlaceholder": "gpt-4o-mini",

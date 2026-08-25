@@ -292,6 +292,63 @@ fn write_providers(providers: &[serde_json::Value]) -> Result<AccioWriteOutcome,
     })
 }
 
+/// 尽力而为地改写 Accio 的「子代理模型路由缓存」。
+///
+/// Accio 的子代理（skill-executor 等）默认模型与主会话模型由官方网关下发的
+/// 独立策略决定，并缓存于 `~/.accio/subagent_model_routing_cache.json`
+/// （`snapshots.<host>.policy.defaultAction.modelCode`，常见为
+/// `1Nova-Q3xM8vJ1rH6z`）。CC Switch 在每次启动/重启 Accio 时把该策略改写为
+/// 当前配置的主模型，让子代理与主会话使用同一模型，直到 Accio 下次重新拉取
+/// 官方策略为止。
+///
+/// 这是「尽力而为」的非关键副作用：文件缺失、JSON 结构随版本变化、写盘失败
+/// 均被容忍，绝不阻断 Accio 启动。
+pub fn rewrite_subagent_model_routing(model: &str) {
+    let path = get_accio_dir().join("subagent_model_routing_cache.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return, // 文件不存在等情况直接忽略
+    };
+    let mut root: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "[accio] failed to parse subagent routing cache {}: {error}",
+                path.display()
+            );
+            return;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(snapshots) = root.get_mut("snapshots").and_then(|v| v.as_object_mut()) {
+        for entry in snapshots.values_mut() {
+            if let Some(default_action) = entry
+                .get_mut("policy")
+                .and_then(|v| v.get_mut("defaultAction"))
+            {
+                if default_action.get("modelCode").is_some() {
+                    default_action["modelCode"] = serde_json::Value::String(model.to_string());
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        let pretty =
+            serde_json::to_string_pretty(&root).unwrap_or_else(|_| root.to_string());
+        if let Err(error) = atomic_write(&path, pretty.as_bytes()) {
+            log::warn!(
+                "[accio] failed to rewrite subagent routing cache {}: {error}",
+                path.display()
+            );
+            return;
+        }
+        log::info!("[accio] rewrote subagent model routing cache default model -> {model}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +451,43 @@ mod tests {
 
         let error = get_providers().expect_err("malformed config should fail");
         assert!(error.to_string().contains("JSON"));
+    }
+
+    #[test]
+    #[serial]
+    fn rewrite_subagent_model_routing_updates_default_action() {
+        let _guard = AccioHome::new();
+        let dir = get_accio_dir();
+        std::fs::create_dir_all(&dir).expect("create accio home");
+        let path = dir.join("subagent_model_routing_cache.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 2,
+  "snapshots": {
+    "https://phoenix-gw.alibaba.com::a": {
+      "policy": { "defaultAction": { "type": "fixed_model", "modelCode": "1Nova-Q3xM8vJ1rH6z" } },
+      "acceptedAt": 100
+    },
+    "http://127.0.0.1:15721/accio::b": {
+      "policy": { "defaultAction": { "type": "fixed_model", "modelCode": "1Nova-Q3xM8vJ1rH6z" } },
+      "acceptedAt": 200
+    }
+  }
+}"#,
+        )
+        .expect("write cache");
+
+        rewrite_subagent_model_routing("deepseek-v4-flash");
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read cache"))
+                .expect("parse cache");
+        for entry in rewritten["snapshots"].as_object().unwrap().values() {
+            assert_eq!(
+                entry["policy"]["defaultAction"]["modelCode"],
+                "deepseek-v4-flash"
+            );
+        }
     }
 }
