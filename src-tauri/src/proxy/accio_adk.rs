@@ -24,6 +24,19 @@ const ACCIO_DEEPSEEK_V4_CONTEXT_WINDOW: u64 = 1_000_000;
 const ACCIO_OFFICIAL_GATEWAY: &str = "https://phoenix-gw.alibaba.com";
 const ACCIO_PROXY_PREFIX: &str = "/accio";
 
+/// Accio 传输层对 SSE 流有约 90s 的空闲超时（`SSE stream idle timeout`）。
+/// DeepSeek 思考模型在上下文很大时可能 200 后长时间不出首 token，上游静默
+/// 期间代理不发任何字节，Accio 会在 90s 掐断整轮导致「网络中断，结果未传回」。
+/// 缓解策略：
+///   1. 上游静默达到 `ACCIO_KEEPALIVE_INTERVAL` 时，向 Accio 发 SSE 注释帧
+///      （`: keepalive`）重置其空闲计时器——上游慢但还活着时不再被误杀；
+///   2. 上游静默达到 `ACCIO_UPSTREAM_STALL_RETRY_AFTER` 时，主动断开并重新
+///      发送同一请求（最多 `ACCIO_STALL_MAX_ATTEMPTS` 次），把「必然失败」
+///      变成「重试后大概率成功」。
+const ACCIO_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const ACCIO_UPSTREAM_STALL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const ACCIO_STALL_MAX_ATTEMPTS: u32 = 2;
+
 fn request_text(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_str)
@@ -784,151 +797,234 @@ fn drain_next_sse_block(buffer: &mut Vec<u8>) -> Option<String> {
     Some(block)
 }
 
-fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+fn adk_stream(
+    first_response: reqwest::Response,
+    retry_request: impl Fn() -> reqwest::RequestBuilder,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
-        let start = std::time::Instant::now();
-        let mut reasoning_chars = 0usize;
-        let mut stream = upstream.bytes_stream();
-        // Buffer raw bytes, never lossily-decoded per chunk. Decoding each
-        // incoming chunk with `from_utf8_lossy` corrupts any multi-byte UTF-8
-        // character (Chinese, emoji, …) that happens to straddle a network
-        // chunk boundary — the incomplete trailing bytes become U+FFFD (乱码).
-        // Only a complete `\n\n`-terminated SSE block is decoded to UTF-8, so a
-        // character split across chunks is reassembled before decoding.
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
-        let mut reasoning_buffer = String::new();
+        let mut pending: Option<reqwest::Response> = Some(first_response);
+        let mut attempt = 0u32;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
-            buffer.extend_from_slice(&chunk);
-            buffer = normalize_crlf(buffer);
-
-            while let Some(block) = drain_next_sse_block(&mut buffer) {
-                let Some(object) = block.lines().find_map(parse_openai_sse_object) else {
-                    continue;
-                };
-                let Some(choices) = object.get("choices").and_then(Value::as_array) else {
-                    continue;
-                };
-                let Some(choice) = choices.first() else {
-                    continue;
-                };
-                let delta = choice.get("delta").unwrap_or(&Value::Null);
-                let finish_reason = choice
-                    .get("finish_reason")
-                    .or_else(|| choice.get("finishReason"))
-                    .and_then(Value::as_str);
-
-                let mut parts = Vec::new();
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        if !reasoning_buffer.is_empty() {
-                            parts.push(json!({
-                                "thought": true,
-                                "text": std::mem::take(&mut reasoning_buffer),
-                            }));
-                        }
-                        parts.push(json!({ "text": text }));
+        'attempts: loop {
+            let upstream = match pending.take() {
+                Some(response) => response,
+                None => match retry_request().send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("[Accio] retry send failed: {error}");
+                        yield Err(std::io::Error::other(error.to_string()));
+                        break 'attempts;
                     }
-                }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    if !reasoning.is_empty() {
-                        reasoning_chars += reasoning.chars().count();
-                        reasoning_buffer.push_str(reasoning);
-                    }
-                }
-
-                if let Some(raw_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                    if !raw_tool_calls.is_empty() && !reasoning_buffer.is_empty() {
-                        parts.push(json!({
-                            "thought": true,
-                            "text": std::mem::take(&mut reasoning_buffer),
-                        }));
-                    }
-                    for raw_call in raw_tool_calls {
-                        let index = raw_call
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(tool_calls.len() as u64);
-                        let entry = tool_calls.entry(index).or_default();
-                        if let Some(id) = raw_call.get("id").and_then(Value::as_str) {
-                            entry.id = id.to_string();
-                        }
-                        if let Some(function) = raw_call.get("function") {
-                            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                                entry.arguments.push_str(arguments);
-                            }
-                        }
-                    }
-                }
-
-                if finish_reason.is_some() {
-                    if !reasoning_buffer.is_empty() {
-                        parts.push(json!({
-                            "thought": true,
-                            "text": std::mem::take(&mut reasoning_buffer),
-                        }));
-                    }
-                    let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
-                    ordered_indices.sort_unstable();
-                    for index in ordered_indices {
-                        let call = &tool_calls[&index];
-                        log::info!(
-                            "[Accio] emit functionCall id={} name={} args={}",
-                            call.id,
-                            call.name,
-                            call.arguments
-                        );
-                        parts.push(json!({
-                            "functionCall": {
-                                "id": call.id,
-                                "name": call.name,
-                                "argsJson": call.arguments,
-                            },
-                        }));
-                    }
-                    tool_calls.clear();
-                }
-
-                if !parts.is_empty() || finish_reason.is_some() {
-                    let usage = object.get("usage").filter(|usage| !usage.is_null());
-                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage)));
-                }
+                },
+            };
+            let status = upstream.status();
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt + 1 < ACCIO_STALL_MAX_ATTEMPTS {
+                log::warn!("[Accio] retry upstream 429, sleeping 10s (attempt {attempt})");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                attempt += 1;
+                continue;
             }
-        }
+            if !status.is_success() {
+                // 仅重试会出现（首次响应已在 handle_adk_llm 校验并转成中文错误体）。
+                let text = upstream.text().await.unwrap_or_default();
+                log::error!("[Accio] retry upstream status={status} body={text}");
+                yield Ok(sse_block(&adk_frame(
+                    vec![json!({"text": "上游模型服务请求失败，请稍后重试。"})],
+                    Some("STOP"),
+                    None,
+                )));
+                break 'attempts;
+            }
 
-        if !reasoning_buffer.is_empty() {
-            yield Ok(sse_block(&adk_frame(
-                vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
-                None,
-                None,
-            )));
-        }
-        if !tool_calls.is_empty() {
-            let mut parts = Vec::new();
-            let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
-            ordered_indices.sort_unstable();
-            for index in ordered_indices {
-                let call = &tool_calls[&index];
-                parts.push(json!({
-                    "functionCall": {
-                        "id": call.id,
-                        "name": call.name,
-                        "argsJson": call.arguments,
+            let start = std::time::Instant::now();
+            let mut reasoning_chars = 0usize;
+            let mut stream = upstream.bytes_stream();
+            // Buffer raw bytes, never lossily-decoded per chunk. Decoding each
+            // incoming chunk with `from_utf8_lossy` corrupts any multi-byte UTF-8
+            // character (Chinese, emoji, …) that happens to straddle a network
+            // chunk boundary — the incomplete trailing bytes become U+FFFD (乱码).
+            // Only a complete `\n\n`-terminated SSE block is decoded to UTF-8, so a
+            // character split across chunks is reassembled before decoding.
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
+            let mut reasoning_buffer = String::new();
+            // 上游静默计时：只被上游数据重置；keepalive 帧不重置它。
+            let mut last_activity = std::time::Instant::now();
+            // 下一次向下游发 keepalive 的绝对时间。
+            let mut next_keepalive_at = last_activity + ACCIO_KEEPALIVE_INTERVAL;
+
+            'stream: loop {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_activity) >= ACCIO_UPSTREAM_STALL_RETRY_AFTER {
+                    break 'stream;
+                }
+                let wait = next_keepalive_at.saturating_duration_since(now);
+                tokio::select! {
+                    chunk = stream.next() => match chunk {
+                        Some(Ok(chunk)) => {
+                            last_activity = std::time::Instant::now();
+                            next_keepalive_at = last_activity + ACCIO_KEEPALIVE_INTERVAL;
+                            buffer.extend_from_slice(&chunk);
+                            buffer = normalize_crlf(buffer);
+
+                            while let Some(block) = drain_next_sse_block(&mut buffer) {
+                                let Some(object) = block.lines().find_map(parse_openai_sse_object) else {
+                                    continue;
+                                };
+                                let Some(choices) = object.get("choices").and_then(Value::as_array) else {
+                                    continue;
+                                };
+                                let Some(choice) = choices.first() else {
+                                    continue;
+                                };
+                                let delta = choice.get("delta").unwrap_or(&Value::Null);
+                                let finish_reason = choice
+                                    .get("finish_reason")
+                                    .or_else(|| choice.get("finishReason"))
+                                    .and_then(Value::as_str);
+
+                                let mut parts = Vec::new();
+                                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        if !reasoning_buffer.is_empty() {
+                                            parts.push(json!({
+                                                "thought": true,
+                                                "text": std::mem::take(&mut reasoning_buffer),
+                                            }));
+                                        }
+                                        parts.push(json!({ "text": text }));
+                                    }
+                                }
+                                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                                    if !reasoning.is_empty() {
+                                        reasoning_chars += reasoning.chars().count();
+                                        reasoning_buffer.push_str(reasoning);
+                                    }
+                                }
+
+                                if let Some(raw_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                                    if !raw_tool_calls.is_empty() && !reasoning_buffer.is_empty() {
+                                        parts.push(json!({
+                                            "thought": true,
+                                            "text": std::mem::take(&mut reasoning_buffer),
+                                        }));
+                                    }
+                                    for raw_call in raw_tool_calls {
+                                        let index = raw_call
+                                            .get("index")
+                                            .and_then(Value::as_u64)
+                                            .unwrap_or(tool_calls.len() as u64);
+                                        let entry = tool_calls.entry(index).or_default();
+                                        if let Some(id) = raw_call.get("id").and_then(Value::as_str) {
+                                            entry.id = id.to_string();
+                                        }
+                                        if let Some(function) = raw_call.get("function") {
+                                            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                                                entry.name = name.to_string();
+                                            }
+                                            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                                                entry.arguments.push_str(arguments);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if finish_reason.is_some() {
+                                    if !reasoning_buffer.is_empty() {
+                                        parts.push(json!({
+                                            "thought": true,
+                                            "text": std::mem::take(&mut reasoning_buffer),
+                                        }));
+                                    }
+                                    let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
+                                    ordered_indices.sort_unstable();
+                                    for index in ordered_indices {
+                                        let call = &tool_calls[&index];
+                                        log::info!(
+                                            "[Accio] emit functionCall id={} name={} args={}",
+                                            call.id,
+                                            call.name,
+                                            call.arguments
+                                        );
+                                        parts.push(json!({
+                                            "functionCall": {
+                                                "id": call.id,
+                                                "name": call.name,
+                                                "argsJson": call.arguments,
+                                            },
+                                        }));
+                                    }
+                                    tool_calls.clear();
+                                }
+
+                                if !parts.is_empty() || finish_reason.is_some() {
+                                    let usage = object.get("usage").filter(|usage| !usage.is_null());
+                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage)));
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            yield Err(std::io::Error::other(error.to_string()));
+                            break 'attempts;
+                        }
+                        None => {
+                            // 上游流正常结束：收尾 flush 残留的 reasoning / tool_calls。
+                            if !reasoning_buffer.is_empty() {
+                                yield Ok(sse_block(&adk_frame(
+                                    vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
+                                    None,
+                                    None,
+                                )));
+                            }
+                            if !tool_calls.is_empty() {
+                                let mut parts = Vec::new();
+                                let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
+                                ordered_indices.sort_unstable();
+                                for index in ordered_indices {
+                                    let call = &tool_calls[&index];
+                                    parts.push(json!({
+                                        "functionCall": {
+                                            "id": call.id,
+                                            "name": call.name,
+                                            "argsJson": call.arguments,
+                                        },
+                                    }));
+                                }
+                                yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
+                            }
+                            log::info!(
+                                "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
+                                start.elapsed()
+                            );
+                            yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                            break 'attempts;
+                        }
                     },
-                }));
+                    _ = tokio::time::sleep(wait) => {
+                        // 上游静默：到 keepalive 节点时向 Accio 发 SSE 注释帧，
+                        // 重置其空闲计时器（90s），避免「上游慢但还活着」被掐断。
+                        if std::time::Instant::now() >= next_keepalive_at {
+                            yield Ok(bytes::Bytes::from_static(b": keepalive\n\n"));
+                            next_keepalive_at = std::time::Instant::now() + ACCIO_KEEPALIVE_INTERVAL;
+                        }
+                    }
+                }
             }
-            yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
+
+            // 只有「上游静默超时」会从 'stream 循环走到这里（正常结束 /
+            // 流错误均已 break 'attempts）。重发请求或放弃。
+            attempt += 1;
+            if attempt >= ACCIO_STALL_MAX_ATTEMPTS {
+                log::error!(
+                    "[Accio] upstream idle >{ACCIO_UPSTREAM_STALL_RETRY_AFTER:?}, giving up after {attempt} attempts"
+                );
+                yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                break 'attempts;
+            }
+            log::warn!(
+                "[Accio] upstream idle >{ACCIO_UPSTREAM_STALL_RETRY_AFTER:?}, re-sending request (attempt {attempt})"
+            );
         }
-        log::info!(
-            "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
-            start.elapsed()
-        );
-        yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
     }
 }
 
@@ -1079,7 +1175,23 @@ pub async fn handle_adk_llm(
         return Ok((status, Json(error_body)).into_response());
     }
 
-    let stream = adk_stream(upstream);
+    // 首响应已校验为 200；adk_stream 内部在遇到上游静默超时会用
+    // retry_request 重建同一请求重发（参数、鉴权、地址与首次一致）。
+    let retry_url = upstream_url.clone();
+    let retry_api_key = api_key.clone();
+    let retry_body = openai_body.to_string();
+    let stream = adk_stream(upstream, move || {
+        let mut builder = super::http_client::get()
+            .post(&retry_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/event-stream")
+            .header(header::ACCEPT_ENCODING, "identity")
+            .body(retry_body.clone());
+        if !retry_api_key.is_empty() {
+            builder = builder.bearer_auth(&retry_api_key);
+        }
+        builder
+    });
     let response = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
