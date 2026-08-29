@@ -428,6 +428,10 @@ pub struct AppSettings {
     pub hermes_config_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accio_config_dir: Option<String>,
+    /// Accio 桌面应用可执行文件路径（Windows 例如
+    /// `D:\\Program Files\\Accio\\Accio.exe`）。为空时按平台默认路径自动发现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accio_app_path: Option<String>,
 
     // ===== 当前供应商 ID（设备级）=====
     /// 当前 Claude 供应商 ID（本地存储，优先于数据库 is_current）
@@ -543,6 +547,7 @@ impl Default for AppSettings {
             openclaw_config_dir: None,
             hermes_config_dir: None,
             accio_config_dir: None,
+            accio_app_path: None,
             current_provider_claude: None,
             current_provider_claude_desktop: None,
             current_provider_codex: None,
@@ -627,6 +632,13 @@ impl AppSettings {
 
         self.accio_config_dir = self
             .accio_config_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        self.accio_app_path = self
+            .accio_app_path
             .as_ref()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
@@ -957,6 +969,23 @@ pub fn get_accio_override_dir() -> Option<PathBuf> {
         .accio_config_dir
         .as_ref()
         .map(|p| resolve_override_path(p))
+}
+
+/// 用户手动的 Accio 桌面应用可执行文件覆盖路径（持久化到设置）。
+/// 优先级低于 `ACCIO_APP_PATH` 环境变量，高于自动发现。
+pub fn get_accio_app_override_path() -> Option<PathBuf> {
+    let settings = settings_store().read().ok()?;
+    settings
+        .accio_app_path
+        .as_ref()
+        .map(|p| resolve_override_path(p))
+}
+
+/// 持久化 Accio 桌面应用可执行文件覆盖路径。传 `None` 清除覆盖。
+pub fn set_accio_app_path(path: Option<String>) -> Result<(), AppError> {
+    mutate_settings(|settings| {
+        settings.accio_app_path = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    })
 }
 
 pub fn preserve_codex_official_auth_on_switch() -> bool {

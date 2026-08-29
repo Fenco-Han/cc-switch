@@ -910,6 +910,7 @@
       "reasoningEfforts": "思考等级",
       "defaultReasoningEffort": "默认思考等级",
       "contextWindow": "上下文窗口",
+      "contextWindowPlaceholder": "例如: 128000",
       "noModels": "暂无模型配置",
       "toggleModelDetails": "展开或收起模型详情",
       "modelIdPlaceholder": "gpt-4o-mini",

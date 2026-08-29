@@ -910,6 +910,7 @@
       "reasoningEfforts": "推論レベル",
       "defaultReasoningEffort": "デフォルトレベル",
       "contextWindow": "コンテキストウィンドウ",
+      "contextWindowPlaceholder": "例: 128000",
       "noModels": "モデルがありません",
       "toggleModelDetails": "モデル詳細を展開または折りたたむ",
       "modelIdPlaceholder": "gpt-4o-mini",

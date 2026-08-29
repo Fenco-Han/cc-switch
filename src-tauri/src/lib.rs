@@ -1600,6 +1600,8 @@ pub fn run() {
             commands::get_accio_live_provider_ids,
             commands::get_accio_live_provider,
             commands::launch_accio,
+            commands::get_accio_app_path,
+            commands::set_accio_app_path,
             // Global upstream proxy
             commands::get_global_proxy_url,
             commands::set_global_proxy_url,

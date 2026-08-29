@@ -9,7 +9,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
@@ -24,12 +24,122 @@ const ACCIO_DEEPSEEK_V4_CONTEXT_WINDOW: u64 = 1_000_000;
 const ACCIO_OFFICIAL_GATEWAY: &str = "https://phoenix-gw.alibaba.com";
 const ACCIO_PROXY_PREFIX: &str = "/accio";
 
+/// Accio 传输层对 SSE 流有约 90s 的空闲超时（`SSE stream idle timeout`）。
+/// DeepSeek 思考模型在上下文很大时可能 200 后长时间不出首 token，上游静默
+/// 期间代理不发任何字节，Accio 会在 90s 掐断整轮导致「网络中断，结果未传回」。
+/// 缓解策略：
+///   1. 上游静默达到 `ACCIO_KEEPALIVE_INTERVAL` 时，向 Accio 发 SSE 注释帧
+///      （`: keepalive`）重置其空闲计时器——上游慢但还活着时不再被误杀；
+///   2. 上游静默达到 `ACCIO_UPSTREAM_STALL_RETRY_AFTER` 时，主动断开并重新
+///      发送同一请求（最多 `ACCIO_STALL_MAX_ATTEMPTS` 次），把「必然失败」
+///      变成「重试后大概率成功」。
+const ACCIO_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const ACCIO_UPSTREAM_STALL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const ACCIO_STALL_MAX_ATTEMPTS: u32 = 2;
+
 fn request_text(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// 把上游(海康 MaaS 等)的错误响应翻译成对 Accio 友好的中文错误 body。
+///
+/// 海康返回的错误体结构多样(OpenAI 风格 `{"error":{"message":...}}` 或
+/// `{"detail":{"error":{"message":...}}}`)，Accio 前端往往只显示到状态码
+/// 就丢了详情(例如只显示「网络请求失败 (400)」)。这里先把原始 message 提取
+/// 出来，再根据【原始错误内容 + 状态码】映射成清晰的中文说明，统一回成标准的
+/// OpenAI 错误结构 `{"error":{"message":...,"type":"upstream_error","code":...}}`，
+/// 让 Accio 页面能把原因真正展示出来。
+///
+/// `hint` 是 Accio 侧生成的额外提示(如请求上下文太大)，优先拼在最前。
+fn upstream_error_body(status: u16, body_text: &str, hint: &str) -> Value {
+    // 从上游 body 里提取原始错误 message(兼容 OpenAI 与海康 detail 两种结构)。
+    let mut raw_message = String::new();
+    if let Ok(value) = serde_json::from_str::<Value>(body_text) {
+        if let Some(msg) = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            raw_message = msg;
+        } else if let Some(msg) = value
+            .pointer("/detail/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            raw_message = msg;
+        }
+    }
+    if raw_message.is_empty() && !body_text.trim().is_empty() {
+        raw_message = body_text.trim().to_string();
+    }
+
+    let friendly = friendly_accio_error(status, &raw_message);
+
+    // 把原始信息也带上，方便排障；hint 放最前，让 Accio 先看到结论。
+    let mut message = String::new();
+    if !hint.is_empty() {
+        message.push_str(hint);
+        message.push_str("。");
+    }
+    message.push_str(&friendly);
+    if !raw_message.is_empty() {
+        message.push_str(&format!("（原始信息: {raw_message}）"));
+    }
+
+    json!({
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": status,
+        }
+    })
+}
+
+/// 状态码 + 原始错误内容 → 友好中文错误描述(优先精确匹配原始内容)。
+fn friendly_accio_error(status: u16, raw: &str) -> String {
+    let raw_lower = raw.to_ascii_lowercase();
+    // 按原始错误内容精确/关键词匹配(优先于状态码，因为同一状态码多种含义)。
+    let by_message = [
+        ("bad request", "请求无效"),
+        ("parameter invalid", "参数错误"),
+        ("api key is invalid", "API-KEY 无效，请联系空间管理员确认后修改"),
+        ("request invalid", "请求校验失败"),
+        ("forbidden", "请求拒绝，服务限流"),
+        ("model service request has reached the limit", "模型服务请求已到上限"),
+        ("the api-key does not match the workspace", "apikey 以及用户关联的工作空间不匹配"),
+        ("not found", "请求的资源不存在"),
+        ("too many requests", "请求过于频繁"),
+        ("internal server error", "服务器内部错误"),
+        ("redis read or write failure", "redis 读写失败"),
+        ("internal error", "内部错误"),
+        ("knowledge not be authorized", "知识库未授权操作，该操作仅创建人可执行"),
+        ("maas-web-config service is incorrect", "maas-web-config 服务不正确"),
+        ("maas-knowledge-manage service is incorrect", "maas-knowledge-manage 服务不正确"),
+        ("no deployments available", "所选模型当前没有可用部署，请稍后重试"),
+    ];
+    for (key, zh) in by_message {
+        if raw_lower.contains(key) {
+            return zh.to_string();
+        }
+    }
+
+    // 未匹配到内容则退化为按状态码的通用中文。
+    match status {
+        400 => "请求无效".to_string(),
+        401 => "认证失败，请检查 API-KEY".to_string(),
+        403 => "请求拒绝，服务限流（模型服务访问已超承载上限，请稍后重试）".to_string(),
+        404 => "请求的资源不存在".to_string(),
+        429 => "请求过于频繁（模型服务访问已超承载上限，请稍后重试）".to_string(),
+        500 => "服务器内部错误（系统出现异常，请联系技术支持）".to_string(),
+        502 => "上游网关错误".to_string(),
+        503 => "上游服务不可用".to_string(),
+        504 => "上游网关超时".to_string(),
+        _ => format!("上游服务错误（HTTP {status}）"),
+    }
 }
 
 fn deepseek_models() -> Vec<Value> {
@@ -225,15 +335,64 @@ fn role_for_openai(role: &str) -> &'static str {
     }
 }
 
-fn tool_response_content(response_json: &str) -> Value {
+/// 把工具返回的 responseJson（一般是 JSON 字符串）转成海康能接受的字符串 content。
+/// 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串；不能是 JSON 对象。
+/// 若解析出的是对象/数组，则整体序列化为紧凑 JSON 字符串下发。
+fn serialize_tool_response_content(response_json: &str) -> Value {
     match serde_json::from_str::<Value>(response_json) {
-        Ok(value) => value
-            .get("content")
-            .or_else(|| value.get("response"))
-            .cloned()
-            .unwrap_or(value),
+        Ok(Value::String(s)) => Value::String(s),
+        Ok(value) => serialize_json_value_to_string(&value),
         Err(_) => Value::String(response_json.to_string()),
     }
+}
+
+/// 把任意 JSON Value 序列化为字符串（对象/数组/数字/布尔都转字符串）。
+fn serialize_json_value_to_string(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(s.clone()),
+        other => Value::String(other.to_string()),
+    }
+}
+
+/// 把一个 ADK `functionResponse` part 转成 OpenAI `role:"tool"` 消息并压入 messages。
+///
+/// Accio/ADK 并不保证 functionResponse 一定放在 `role:"tool"` 的 content 里——
+/// 实测它可能和 functionCall 一起放在同一个 `role:"model"` content 中，也可能
+/// 单独出现在 model/user content 里。因此转换时不能按 content 角色过滤，必须在
+/// 任意位置识别 functionResponse 并生成 tool 消息，否则 assistant 的 tool_calls
+/// 后面没有对应的 tool 消息，DeepSeek 会返回 400
+/// 「An assistant message with 'tool_calls' must be followed by tool messages...」。
+fn push_tool_response(
+    messages: &mut Vec<Value>,
+    response: &Value,
+    tool_call_counter: &mut usize,
+) {
+    let id = request_text(response.get("id"));
+    // 海康/litellm 要求 `role:"tool"` 消息的 content 必须是字符串。
+    // 若工具返回的是结构化 JSON 对象，将其序列化为字符串再下发，
+    // 否则海康会以 400 Bad Request 拒绝。
+    let content = response
+        .get("responseJson")
+        .or_else(|| response.get("response_json"))
+        .and_then(Value::as_str)
+        .map(serialize_tool_response_content)
+        .or_else(|| {
+            if let Some(value) = response.get("response") {
+                Some(serialize_json_value_to_string(value))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| Value::Null);
+    messages.push(json!({
+        "role": "tool",
+        "tool_call_id": if id.is_empty() {
+            format!("call_{tool_call_counter}")
+        } else {
+            id
+        },
+        "content": content,
+    }));
 }
 
 fn convert_accio_contents(body: &Value) -> Vec<Value> {
@@ -255,6 +414,58 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
         return messages;
     };
 
+    /// 把累积的 pending assistant（thought/text/tool_calls 可能分散在多个
+    /// assistant content/part 中）刷成一条 OpenAI assistant 消息。
+    ///
+    /// Accio/ADK 会把一个 assistant 回合拆成多条 `thought` / `text` /
+    /// `functionCall` part。DeepSeek 的 thinking 模式要求 assistant 消息在
+    /// 携带 `reasoning_content`（思考内容）时，后续请求必须把它原样回传，
+    /// 否则返回「The `reasoning_content` in the thinking mode must be passed
+    /// back to the API」400 错误。这里把 `thought` part 映射为
+    /// `reasoning_content`，与同回合的 `text`（content）和 `functionCall`
+    /// （tool_calls）合并为一条 assistant 消息，避免子代理等场景下的 400。
+    fn flush_assistant(
+        messages: &mut Vec<Value>,
+        reasoning: &mut String,
+        text: &mut String,
+        tool_calls: &mut Vec<Value>,
+    ) {
+        let has_reasoning = !reasoning.is_empty();
+        let has_text = !text.is_empty();
+        let has_tools = !tool_calls.is_empty();
+        if !has_reasoning && !has_text && !has_tools {
+            return;
+        }
+
+        let mut msg = Map::new();
+        msg.insert("role".to_string(), Value::String("assistant".to_string()));
+        // DeepSeek thinking 模式下 content 可为 null（纯思考 + 工具调用），
+        // 但普通非思考文本应保留为字符串。
+        msg.insert(
+            "content".to_string(),
+            if has_text {
+                Value::String(std::mem::take(text))
+            } else {
+                Value::Null
+            },
+        );
+        if has_reasoning {
+            msg.insert(
+                "reasoning_content".to_string(),
+                Value::String(std::mem::take(reasoning)),
+            );
+        }
+        if has_tools {
+            msg.insert("tool_calls".to_string(), Value::Array(std::mem::take(tool_calls)));
+        }
+        messages.push(Value::Object(msg));
+    }
+
+    let mut pending_reasoning = String::new();
+    let mut pending_text = String::new();
+    let mut pending_tool_calls: Vec<Value> = Vec::new();
+    let mut tool_call_counter = 0usize;
+
     for content in contents {
         let role = role_for_openai(
             content
@@ -266,63 +477,121 @@ fn convert_accio_contents(body: &Value) -> Vec<Value> {
             continue;
         };
 
-        for part in parts {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    messages.push(json!({ "role": role, "content": text }));
+        if role == "assistant" {
+            // 累积 assistant 回合：thought / text / functionCall 合并。
+            for part in parts {
+                // functionResponse 可能与 functionCall 同在一个 model content
+                // 里（Accio 实测如此）：先把已累积的 assistant（含 tool_calls）
+                // 刷出，再补对应的 tool 消息，保证 DeepSeek 收到
+                // assistant(tool_calls) → tool 的正确序列。
+                if let Some(response) = part
+                    .get("functionResponse")
+                    .or_else(|| part.get("function_response"))
+                {
+                    flush_assistant(
+                        &mut messages,
+                        &mut pending_reasoning,
+                        &mut pending_text,
+                        &mut pending_tool_calls,
+                    );
+                    push_tool_response(&mut messages, response, &mut tool_call_counter);
+                    continue;
                 }
-                continue;
-            }
 
-            if let Some(call) = part.get("functionCall").or_else(|| part.get("function_call")) {
-                let id = request_text(call.get("id"));
-                let name = request_text(call.get("name"));
-                let arguments = call
-                    .get("argsJson")
-                    .or_else(|| call.get("args_json"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        call.get("args").and_then(|args| {
-                            if let Some(args) = args.as_str() {
-                                Some(args.to_string())
-                            } else {
-                                serde_json::to_string(args).ok()
-                            }
+                let is_thought = part
+                    .get("thought")
+                    .map(|v| v.as_bool().unwrap_or(false))
+                    .unwrap_or(false)
+                    || part.get("type").and_then(Value::as_str) == Some("thought");
+                if is_thought {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        if !pending_reasoning.is_empty() {
+                            pending_reasoning.push('\n');
+                        }
+                        pending_reasoning.push_str(t);
+                    }
+                    continue;
+                }
+
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        if !pending_text.is_empty() {
+                            pending_text.push('\n');
+                        }
+                        pending_text.push_str(text);
+                    }
+                    continue;
+                }
+
+                if let Some(call) =
+                    part.get("functionCall").or_else(|| part.get("function_call"))
+                {
+                    let id = request_text(call.get("id"));
+                    let name = request_text(call.get("name"));
+                    let arguments = call
+                        .get("argsJson")
+                        .or_else(|| call.get("args_json"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            call.get("args").and_then(|args| {
+                                if let Some(args) = args.as_str() {
+                                    Some(args.to_string())
+                                } else {
+                                    serde_json::to_string(args).ok()
+                                }
+                            })
                         })
-                    })
-                    .unwrap_or_default();
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": Value::Null,
-                    "tool_calls": [{
-                        "id": if id.is_empty() { format!("call_{}", messages.len()) } else { id },
+                        .unwrap_or_default();
+                    tool_call_counter += 1;
+                    pending_tool_calls.push(json!({
+                        "id": if id.is_empty() {
+                            format!("call_{tool_call_counter}")
+                        } else {
+                            id
+                        },
                         "type": "function",
                         "function": { "name": name, "arguments": arguments },
-                    }],
-                }));
-                continue;
+                    }));
+                    continue;
+                }
             }
+            continue;
+        }
 
+        // role == "tool" | "user"：先刷新已累积的 assistant，再按 part 处理。
+        flush_assistant(
+            &mut messages,
+            &mut pending_reasoning,
+            &mut pending_text,
+            &mut pending_tool_calls,
+        );
+
+        for part in parts {
+            // functionResponse 也可能出现在 role="user"/"tool" 的 content 里
+            //（Gemini 风格），统一在此识别并转成 tool 消息。
             if let Some(response) = part
                 .get("functionResponse")
                 .or_else(|| part.get("function_response"))
             {
-                let id = request_text(response.get("id"));
-                let content = response
-                    .get("responseJson")
-                    .or_else(|| response.get("response_json"))
-                    .and_then(Value::as_str)
-                    .map(tool_response_content)
-                    .unwrap_or_else(|| response.get("response").cloned().unwrap_or(Value::Null));
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": if id.is_empty() { format!("call_{}", messages.len()) } else { id },
-                    "content": content,
-                }));
+                push_tool_response(&mut messages, response, &mut tool_call_counter);
+                continue;
+            }
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    messages.push(json!({ "role": role, "content": text }));
+                }
             }
         }
     }
+
+    // 收尾：flush 最后一段 assistant 累积。
+    flush_assistant(
+        &mut messages,
+        &mut pending_reasoning,
+        &mut pending_text,
+        &mut pending_tool_calls,
+    );
 
     messages
 }
@@ -489,148 +758,273 @@ struct OpenAiToolCall {
     arguments: String,
 }
 
-fn adk_stream(upstream: reqwest::Response) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+/// Normalize `\r\n` to `\n` on the raw SSE byte buffer so that both `\n\n` and
+/// `\r\n\r\n` terminators collapse to the same `\n\n` block delimiter.
+fn normalize_crlf(bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.contains(&b'\r') {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            out.push(b'\n');
+            i += 2;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Index of the first `\n\n` block delimiter, or `None`. Mirrors the previous
+/// string-buffer `buffer.find("\n\n")` semantics on the raw byte buffer.
+fn find_double_newline(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|window| window == b"\n\n")
+}
+
+/// Extract the next complete `\n\n`-terminated SSE block from the raw byte
+/// buffer (which is normalized to `\n` line endings) and decode it to UTF-8.
+/// Returns `None` when no complete block is present yet. Because the block is
+/// delimited by `\n\n`, any multi-byte UTF-8 character that was split across
+/// incoming network chunks is fully reassembled here before decoding, so it is
+/// never corrupted into U+FFFD.
+fn drain_next_sse_block(buffer: &mut Vec<u8>) -> Option<String> {
+    let block_end = find_double_newline(buffer)?;
+    let block = String::from_utf8_lossy(&buffer[..block_end]).into_owned();
+    buffer.drain(..block_end + 2);
+    Some(block)
+}
+
+fn adk_stream(
+    first_response: reqwest::Response,
+    retry_request: impl Fn() -> reqwest::RequestBuilder,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
-        let start = std::time::Instant::now();
-        let mut reasoning_chars = 0usize;
-        let mut stream = upstream.bytes_stream();
-        let mut buffer = String::new();
-        let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
-        let mut reasoning_buffer = String::new();
+        let mut pending: Option<reqwest::Response> = Some(first_response);
+        let mut attempt = 0u32;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            buffer = buffer.replace("\r\n", "\n");
-
-            while let Some(block_end) = buffer.find("\n\n") {
-                let block = buffer[..block_end].to_string();
-                buffer.drain(..=block_end + 1);
-
-                let Some(object) = block.lines().find_map(parse_openai_sse_object) else {
-                    continue;
-                };
-                let Some(choices) = object.get("choices").and_then(Value::as_array) else {
-                    continue;
-                };
-                let Some(choice) = choices.first() else {
-                    continue;
-                };
-                let delta = choice.get("delta").unwrap_or(&Value::Null);
-                let finish_reason = choice
-                    .get("finish_reason")
-                    .or_else(|| choice.get("finishReason"))
-                    .and_then(Value::as_str);
-
-                let mut parts = Vec::new();
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        if !reasoning_buffer.is_empty() {
-                            parts.push(json!({
-                                "thought": true,
-                                "text": std::mem::take(&mut reasoning_buffer),
-                            }));
-                        }
-                        parts.push(json!({ "text": text }));
+        'attempts: loop {
+            let upstream = match pending.take() {
+                Some(response) => response,
+                None => match retry_request().send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("[Accio] retry send failed: {error}");
+                        yield Err(std::io::Error::other(error.to_string()));
+                        break 'attempts;
                     }
-                }
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                    if !reasoning.is_empty() {
-                        reasoning_chars += reasoning.chars().count();
-                        reasoning_buffer.push_str(reasoning);
-                    }
-                }
-
-                if let Some(raw_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                    if !raw_tool_calls.is_empty() && !reasoning_buffer.is_empty() {
-                        parts.push(json!({
-                            "thought": true,
-                            "text": std::mem::take(&mut reasoning_buffer),
-                        }));
-                    }
-                    for raw_call in raw_tool_calls {
-                        let index = raw_call
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(tool_calls.len() as u64);
-                        let entry = tool_calls.entry(index).or_default();
-                        if let Some(id) = raw_call.get("id").and_then(Value::as_str) {
-                            entry.id = id.to_string();
-                        }
-                        if let Some(function) = raw_call.get("function") {
-                            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                                entry.arguments.push_str(arguments);
-                            }
-                        }
-                    }
-                }
-
-                if finish_reason.is_some() {
-                    if !reasoning_buffer.is_empty() {
-                        parts.push(json!({
-                            "thought": true,
-                            "text": std::mem::take(&mut reasoning_buffer),
-                        }));
-                    }
-                    let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
-                    ordered_indices.sort_unstable();
-                    for index in ordered_indices {
-                        let call = &tool_calls[&index];
-                        log::info!(
-                            "[Accio] emit functionCall id={} name={} args={}",
-                            call.id,
-                            call.name,
-                            call.arguments
-                        );
-                        parts.push(json!({
-                            "functionCall": {
-                                "id": call.id,
-                                "name": call.name,
-                                "argsJson": call.arguments,
-                            },
-                        }));
-                    }
-                    tool_calls.clear();
-                }
-
-                if !parts.is_empty() || finish_reason.is_some() {
-                    let usage = object.get("usage").filter(|usage| !usage.is_null());
-                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage)));
-                }
+                },
+            };
+            let status = upstream.status();
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt + 1 < ACCIO_STALL_MAX_ATTEMPTS {
+                log::warn!("[Accio] retry upstream 429, sleeping 10s (attempt {attempt})");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                attempt += 1;
+                continue;
             }
-        }
+            if !status.is_success() {
+                // 仅重试会出现（首次响应已在 handle_adk_llm 校验并转成中文错误体）。
+                let text = upstream.text().await.unwrap_or_default();
+                log::error!("[Accio] retry upstream status={status} body={text}");
+                yield Ok(sse_block(&adk_frame(
+                    vec![json!({"text": "上游模型服务请求失败，请稍后重试。"})],
+                    Some("STOP"),
+                    None,
+                )));
+                break 'attempts;
+            }
 
-        if !reasoning_buffer.is_empty() {
-            yield Ok(sse_block(&adk_frame(
-                vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
-                None,
-                None,
-            )));
-        }
-        if !tool_calls.is_empty() {
-            let mut parts = Vec::new();
-            let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
-            ordered_indices.sort_unstable();
-            for index in ordered_indices {
-                let call = &tool_calls[&index];
-                parts.push(json!({
-                    "functionCall": {
-                        "id": call.id,
-                        "name": call.name,
-                        "argsJson": call.arguments,
+            let start = std::time::Instant::now();
+            let mut reasoning_chars = 0usize;
+            let mut stream = upstream.bytes_stream();
+            // Buffer raw bytes, never lossily-decoded per chunk. Decoding each
+            // incoming chunk with `from_utf8_lossy` corrupts any multi-byte UTF-8
+            // character (Chinese, emoji, …) that happens to straddle a network
+            // chunk boundary — the incomplete trailing bytes become U+FFFD (乱码).
+            // Only a complete `\n\n`-terminated SSE block is decoded to UTF-8, so a
+            // character split across chunks is reassembled before decoding.
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut tool_calls = std::collections::HashMap::<u64, OpenAiToolCall>::new();
+            let mut reasoning_buffer = String::new();
+            // 上游静默计时：只被上游数据重置；keepalive 帧不重置它。
+            let mut last_activity = std::time::Instant::now();
+            // 下一次向下游发 keepalive 的绝对时间。
+            let mut next_keepalive_at = last_activity + ACCIO_KEEPALIVE_INTERVAL;
+
+            'stream: loop {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_activity) >= ACCIO_UPSTREAM_STALL_RETRY_AFTER {
+                    break 'stream;
+                }
+                let wait = next_keepalive_at.saturating_duration_since(now);
+                tokio::select! {
+                    chunk = stream.next() => match chunk {
+                        Some(Ok(chunk)) => {
+                            last_activity = std::time::Instant::now();
+                            next_keepalive_at = last_activity + ACCIO_KEEPALIVE_INTERVAL;
+                            buffer.extend_from_slice(&chunk);
+                            buffer = normalize_crlf(buffer);
+
+                            while let Some(block) = drain_next_sse_block(&mut buffer) {
+                                let Some(object) = block.lines().find_map(parse_openai_sse_object) else {
+                                    continue;
+                                };
+                                let Some(choices) = object.get("choices").and_then(Value::as_array) else {
+                                    continue;
+                                };
+                                let Some(choice) = choices.first() else {
+                                    continue;
+                                };
+                                let delta = choice.get("delta").unwrap_or(&Value::Null);
+                                let finish_reason = choice
+                                    .get("finish_reason")
+                                    .or_else(|| choice.get("finishReason"))
+                                    .and_then(Value::as_str);
+
+                                let mut parts = Vec::new();
+                                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        if !reasoning_buffer.is_empty() {
+                                            parts.push(json!({
+                                                "thought": true,
+                                                "text": std::mem::take(&mut reasoning_buffer),
+                                            }));
+                                        }
+                                        parts.push(json!({ "text": text }));
+                                    }
+                                }
+                                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                                    if !reasoning.is_empty() {
+                                        reasoning_chars += reasoning.chars().count();
+                                        reasoning_buffer.push_str(reasoning);
+                                    }
+                                }
+
+                                if let Some(raw_tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                                    if !raw_tool_calls.is_empty() && !reasoning_buffer.is_empty() {
+                                        parts.push(json!({
+                                            "thought": true,
+                                            "text": std::mem::take(&mut reasoning_buffer),
+                                        }));
+                                    }
+                                    for raw_call in raw_tool_calls {
+                                        let index = raw_call
+                                            .get("index")
+                                            .and_then(Value::as_u64)
+                                            .unwrap_or(tool_calls.len() as u64);
+                                        let entry = tool_calls.entry(index).or_default();
+                                        if let Some(id) = raw_call.get("id").and_then(Value::as_str) {
+                                            entry.id = id.to_string();
+                                        }
+                                        if let Some(function) = raw_call.get("function") {
+                                            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                                                entry.name = name.to_string();
+                                            }
+                                            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                                                entry.arguments.push_str(arguments);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if finish_reason.is_some() {
+                                    if !reasoning_buffer.is_empty() {
+                                        parts.push(json!({
+                                            "thought": true,
+                                            "text": std::mem::take(&mut reasoning_buffer),
+                                        }));
+                                    }
+                                    let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
+                                    ordered_indices.sort_unstable();
+                                    for index in ordered_indices {
+                                        let call = &tool_calls[&index];
+                                        log::info!(
+                                            "[Accio] emit functionCall id={} name={} args={}",
+                                            call.id,
+                                            call.name,
+                                            call.arguments
+                                        );
+                                        parts.push(json!({
+                                            "functionCall": {
+                                                "id": call.id,
+                                                "name": call.name,
+                                                "argsJson": call.arguments,
+                                            },
+                                        }));
+                                    }
+                                    tool_calls.clear();
+                                }
+
+                                if !parts.is_empty() || finish_reason.is_some() {
+                                    let usage = object.get("usage").filter(|usage| !usage.is_null());
+                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage)));
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            yield Err(std::io::Error::other(error.to_string()));
+                            break 'attempts;
+                        }
+                        None => {
+                            // 上游流正常结束：收尾 flush 残留的 reasoning / tool_calls。
+                            if !reasoning_buffer.is_empty() {
+                                yield Ok(sse_block(&adk_frame(
+                                    vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
+                                    None,
+                                    None,
+                                )));
+                            }
+                            if !tool_calls.is_empty() {
+                                let mut parts = Vec::new();
+                                let mut ordered_indices = tool_calls.keys().copied().collect::<Vec<_>>();
+                                ordered_indices.sort_unstable();
+                                for index in ordered_indices {
+                                    let call = &tool_calls[&index];
+                                    parts.push(json!({
+                                        "functionCall": {
+                                            "id": call.id,
+                                            "name": call.name,
+                                            "argsJson": call.arguments,
+                                        },
+                                    }));
+                                }
+                                yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
+                            }
+                            log::info!(
+                                "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
+                                start.elapsed()
+                            );
+                            yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                            break 'attempts;
+                        }
                     },
-                }));
+                    _ = tokio::time::sleep(wait) => {
+                        // 上游静默：到 keepalive 节点时向 Accio 发 SSE 注释帧，
+                        // 重置其空闲计时器（90s），避免「上游慢但还活着」被掐断。
+                        if std::time::Instant::now() >= next_keepalive_at {
+                            yield Ok(bytes::Bytes::from_static(b": keepalive\n\n"));
+                            next_keepalive_at = std::time::Instant::now() + ACCIO_KEEPALIVE_INTERVAL;
+                        }
+                    }
+                }
             }
-            yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
+
+            // 只有「上游静默超时」会从 'stream 循环走到这里（正常结束 /
+            // 流错误均已 break 'attempts）。重发请求或放弃。
+            attempt += 1;
+            if attempt >= ACCIO_STALL_MAX_ATTEMPTS {
+                log::error!(
+                    "[Accio] upstream idle >{ACCIO_UPSTREAM_STALL_RETRY_AFTER:?}, giving up after {attempt} attempts"
+                );
+                yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                break 'attempts;
+            }
+            log::warn!(
+                "[Accio] upstream idle >{ACCIO_UPSTREAM_STALL_RETRY_AFTER:?}, re-sending request (attempt {attempt})"
+            );
         }
-        log::info!(
-            "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
-            start.elapsed()
-        );
-        yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
     }
 }
 
@@ -731,13 +1125,73 @@ pub async fn handle_adk_llm(
     let status = upstream.status();
     if !status.is_success() {
         let text = upstream.text().await.unwrap_or_default();
-        return Err(ProxyError::UpstreamError {
-            status: status.as_u16(),
-            body: Some(text),
-        });
+        // 把上游错误翻译成 Accio 能展示的中文错误体返回，而不是只透传原始 body
+        // (原始 body 是海康的 detail 结构，Accio 前端往往只显示到状态码就丢了详情)。
+        log::error!(
+            "[Accio] upstream status={status} url={upstream_url} body={text}"
+        );
+        // 排障辅助：把发往上游的 OpenAI 消息骨架打出来（role / tool_call ids /
+        // 是否带 reasoning_content / content 长度），400 一类的结构问题一眼可辨。
+        let skeleton: Vec<Value> = openai_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| {
+                        let tool_call_ids = message
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .map(|calls| {
+                                calls
+                                    .iter()
+                                    .filter_map(|call| {
+                                        call.get("id").and_then(Value::as_str)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        json!({
+                            "role": message.get("role"),
+                            "tool_call_ids": tool_call_ids,
+                            "tool_call_id": message.get("tool_call_id"),
+                            "has_reasoning_content": message
+                                .get("reasoning_content")
+                                .and_then(Value::as_str)
+                                .map(|value| !value.is_empty())
+                                .unwrap_or(false),
+                            "content_len": message
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(str::len)
+                                .unwrap_or(0),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        log::error!("[Accio] outgoing messages skeleton: {skeleton:?}");
+        let error_body = upstream_error_body(status.as_u16(), &text, "");
+        return Ok((status, Json(error_body)).into_response());
     }
 
-    let stream = adk_stream(upstream);
+    // 首响应已校验为 200；adk_stream 内部在遇到上游静默超时会用
+    // retry_request 重建同一请求重发（参数、鉴权、地址与首次一致）。
+    let retry_url = upstream_url.clone();
+    let retry_api_key = api_key.clone();
+    let retry_body = openai_body.to_string();
+    let stream = adk_stream(upstream, move || {
+        let mut builder = super::http_client::get()
+            .post(&retry_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/event-stream")
+            .header(header::ACCEPT_ENCODING, "identity")
+            .body(retry_body.clone());
+        if !retry_api_key.is_empty() {
+            builder = builder.bearer_auth(&retry_api_key);
+        }
+        builder
+    });
     let response = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -908,6 +1362,7 @@ mod tests {
 
     #[test]
     fn converts_text_and_function_parts_to_openai_messages() {
+        // 基础保真：text / functionCall / functionResponse 三种 part。
         let body = json!({
             "system_instruction": "be concise",
             "contents": [
@@ -925,10 +1380,157 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hello");
         assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], serde_json::Value::Null);
         assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "weather");
         assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["content"], "sunny");
+        // tool content 经序列化保持字符串（对象被 JSON 化）
+        assert_eq!(messages[3]["content"], "{\"content\":\"sunny\"}");
+    }
+
+    #[test]
+    fn converts_thought_parts_into_reasoning_content() {
+        // 子代理（skill-executor）场景：assistant 回合包含 thinking(thought)
+        // + 工具调用。DeepSeek 的 thinking 模式要求把 thought 转成
+        // `reasoning_content` 回传，否则 400。
+        let body = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "我需要先读取 SKILL.md 了解子代理如何执行。"},
+                    {"functionCall": {"id": "call_1", "name": "read", "args": "{\"filePath\": \"SKILL.md\"}"}}
+                ]},
+                {"role": "tool", "parts": [
+                    {"functionResponse": {"id": "call_1", "responseJson": "{\"content\":\"# 文档\"}"}}
+                ]}
+            ]
+        });
+
+        let messages = convert_accio_contents(&body);
+        // 只有 assistant（reasoning + tool_call）与 tool 两条消息
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], "我需要先读取 SKILL.md 了解子代理如何执行。");
+        // 纯工具调用（无文本）时 content 为 null
+        assert_eq!(messages[0]["content"], serde_json::Value::Null);
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[1]["role"], "tool");
+    }
+
+    #[test]
+    fn converts_text_thought_and_tool_in_one_assistant() {
+        // 同一个 assistant 回合里同时有 text / thought / functionCall，
+        // 应合并进同一条 assistant 消息。
+        let body = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"text": "我来处理这个请求。"},
+                    {"thought": true, "text": "先定位相关的 SKILL 文档"},
+                    {"functionCall": {"id": "t1", "name": "read", "args": {"file": "SKILL.md"}}}
+                ]}
+            ]
+        });
+
+        let msg = convert_accio_contents(&body);
+        assert_eq!(msg.len(), 1);
+        assert_eq!(msg[0]["role"], "assistant");
+        assert_eq!(msg[0]["content"], "我来处理这个请求。");
+        assert_eq!(msg[0]["reasoning_content"], "先定位相关的 SKILL 文档");
+        assert_eq!(msg[0]["tool_calls"][0]["id"], "t1");
+        assert_eq!(msg[0]["tool_calls"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn converts_thought_part_only_flushes_single_assistant() {
+        // 只有 thought（无 text / tool_calls）时，仍应刷出一条带 reasoning 的
+        // assistant 消息（content = null），不能丢失 thinking 记录。
+        let body = json!({
+            "contents": [
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "思考但无文本回复"}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], "思考但无文本回复");
+        assert_eq!(messages[0]["content"], serde_json::Value::Null);
+        assert!(messages[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn function_response_in_same_model_content_follows_tool_calls() {
+        // Accio 实测会把 functionResponse 和 functionCall 放在同一个
+        // role="model" content 里。转换必须产出 assistant(tool_calls) →
+        // tool 消息，否则 DeepSeek 400「insufficient tool messages」。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "请分析热销数据"}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "先读取技能说明"},
+                    {"text": "我先读取技能说明。"},
+                    {"functionCall": {"id": "call_skill_1", "name": "skill", "args": "{\"action\":\"read\"}"}},
+                    {"functionResponse": {"id": "call_skill_1", "responseJson": "{\"content\":\"# 热销爆品洞察\"}"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "先读取技能说明");
+        assert_eq!(messages[1]["content"], "我先读取技能说明。");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_skill_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_skill_1");
+        assert_eq!(messages[2]["content"], "{\"content\":\"# 热销爆品洞察\"}");
+    }
+
+    #[test]
+    fn function_response_in_separate_model_content_is_kept() {
+        // functionResponse 单独出现在另一个 role="model" content 里同样要识别。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"thought": true, "text": "need tool"},
+                    {"functionCall": {"id": "c1", "name": "read", "args": "{}"}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionResponse": {"id": "c1", "responseJson": "{\"ok\":true}"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "c1");
+        assert_eq!(messages[2]["content"], "{\"ok\":true}");
+    }
+
+    #[test]
+    fn function_response_in_user_content_is_kept() {
+        // Gemini 风格：functionResponse 也可能放在 role="user" content 里。
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "c2", "name": "bash", "args": "{\"cmd\":\"ls\"}"}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"id": "c2", "responseJson": "file1"}}
+                ]}
+            ]
+        });
+        let messages = convert_accio_contents(&body);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "c2");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "c2");
+        assert_eq!(messages[2]["content"], "file1");
     }
 
     #[test]
@@ -1103,5 +1705,53 @@ mod tests {
         assert_eq!(final_frame["finishReason"], "STOP");
         assert_eq!(final_frame["usageMetadata"]["totalTokenCount"], 8);
         assert!(final_frame.get("candidates").is_none());
+    }
+
+    #[test]
+    fn sse_block_split_across_chunks_keeps_multibyte_utf8_intact() {
+        // 采购 is 采(U+91C7, 3 bytes) + 购(U+8D2D, 2 bytes). Build one SSE data
+        // line and split the raw UTF-8 bytes *inside* 采 so the old per-chunk
+        // `from_utf8_lossy` decoding would corrupt it into U+FFFD.
+        let mut block = Vec::new();
+        block.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"1688");
+        block.extend_from_slice("采购".as_bytes());
+        block.extend_from_slice(b"\"}}]}\n\n");
+
+        // 采's first byte (0xE9) sits right after "...1688". Cut after its
+        // second byte (0x87) so chunk 1 ends mid-character.
+        let first_byte_of_cai = block
+            .iter()
+            .position(|&b| b == 0xE9)
+            .expect("采 lead byte present");
+        let split_inside_char = first_byte_of_cai + 2;
+        assert_eq!(block[split_inside_char], 0x87, "chunk split must cut inside 采");
+
+        let mut buffer = Vec::new();
+        // Feed the block in two chunks, splitting mid-character.
+        buffer.extend_from_slice(&block[..split_inside_char]);
+        buffer = normalize_crlf(buffer);
+        assert_eq!(drain_next_sse_block(&mut buffer), None);
+        buffer.extend_from_slice(&block[split_inside_char..]);
+        buffer = normalize_crlf(buffer);
+
+        let decoded = drain_next_sse_block(&mut buffer);
+        assert!(decoded.is_some());
+        let decoded = decoded.unwrap();
+        // Must not contain any U+FFFD replacement char (乱码).
+        assert!(
+            !decoded.contains('\u{FFFD}'),
+            "decoded block contains corrupted replacement char: {decoded:?}"
+        );
+        assert!(decoded.contains("采购"), "expected 采购 intact, got {decoded:?}");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn crlf_terminated_sse_block_is_normalized() {
+        let mut buffer: Vec<u8> = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n".to_vec();
+        buffer = normalize_crlf(buffer);
+        let decoded = drain_next_sse_block(&mut buffer).expect("block should parse");
+        assert!(decoded.contains("\"content\":\"hi\""));
+        assert!(buffer.is_empty());
     }
 }

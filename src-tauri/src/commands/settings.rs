@@ -312,6 +312,19 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
     Ok(true)
 }
 
+/// 获取持久化的 Accio 桌面应用可执行文件路径覆盖。
+#[tauri::command]
+pub fn get_accio_app_path() -> Option<String> {
+    crate::settings::get_accio_app_override_path().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 设置持久化的 Accio 桌面应用可执行文件路径覆盖；传 `None` 清除覆盖。
+#[tauri::command]
+pub fn set_accio_app_path(path: Option<String>) -> Result<bool, String> {
+    crate::settings::set_accio_app_path(path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::merge_settings_for_save;

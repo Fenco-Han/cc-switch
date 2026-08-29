@@ -101,6 +101,16 @@ export const settingsApi = {
     return await invoke("set_app_config_dir_override", { path });
   },
 
+  /** 获取持久化的 Accio 桌面应用可执行文件路径覆盖（Windows 用） */
+  async getAccioAppPath(): Promise<string | null> {
+    return await invoke("get_accio_app_path");
+  },
+
+  /** 设置持久化的 Accio 桌面应用可执行文件路径覆盖；传 null 清除 */
+  async setAccioAppPath(path: string | null): Promise<boolean> {
+    return await invoke("set_accio_app_path", { path });
+  },
+
   async applyClaudePluginConfig(options: {
     official: boolean;
   }): Promise<boolean> {
