@@ -974,7 +974,7 @@ fn adk_stream(
                                     let usage = object.get("usage").filter(|usage| !usage.is_null());
                                     // 带上原始 OpenAI chunk，Accio 需要 raw_response_json。
                                     let raw = object.to_string();
-                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage, Some(&raw))));
+                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage, Some(raw.as_str()))));
                                 }
                             }
                         }
