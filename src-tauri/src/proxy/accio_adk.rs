@@ -716,7 +716,12 @@ fn finish_reason_for_adk(reason: &str) -> String {
     }
 }
 
-fn adk_frame(parts: Vec<Value>, finish_reason: Option<&str>, usage: Option<&Value>) -> Value {
+fn adk_frame(
+    parts: Vec<Value>,
+    finish_reason: Option<&str>,
+    usage: Option<&Value>,
+    raw_response_json: Option<&str>,
+) -> Value {
     let turn_complete = finish_reason.is_some();
     let mut frame = json!({
         "content": {
@@ -735,6 +740,13 @@ fn adk_frame(parts: Vec<Value>, finish_reason: Option<&str>, usage: Option<&Valu
             "candidatesTokenCount": usage.get("completion_tokens").unwrap_or(&Value::Null),
             "totalTokenCount": usage.get("total_tokens").unwrap_or(&Value::Null),
         });
+    }
+    // raw_response_json 必须存在于每一帧：它承载序列化后的 OpenAI
+    // `chat.completion.chunk`。Accio 靠它区分“正规 proto 帧”与“网关直通帧”；
+    // 缺了它会被判为直通帧并中止整轮（GatewayPassthroughError /
+    // consumer_cancelled），群聊(TeamChat) 尤为敏感。
+    if let Some(raw) = raw_response_json {
+        frame["raw_response_json"] = Value::String(raw.to_string());
     }
     frame
 }
@@ -831,6 +843,7 @@ fn adk_stream(
                 yield Ok(sse_block(&adk_frame(
                     vec![json!({"text": "上游模型服务请求失败，请稍后重试。"})],
                     Some("STOP"),
+                    None,
                     None,
                 )));
                 break 'attempts;
@@ -959,7 +972,9 @@ fn adk_stream(
 
                                 if !parts.is_empty() || finish_reason.is_some() {
                                     let usage = object.get("usage").filter(|usage| !usage.is_null());
-                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage)));
+                                    // 带上原始 OpenAI chunk，Accio 需要 raw_response_json。
+                                    let raw = object.to_string();
+                                    yield Ok(sse_block(&adk_frame(parts, finish_reason, usage, Some(&raw))));
                                 }
                             }
                         }
@@ -972,6 +987,7 @@ fn adk_stream(
                             if !reasoning_buffer.is_empty() {
                                 yield Ok(sse_block(&adk_frame(
                                     vec![json!({ "thought": true, "text": std::mem::take(&mut reasoning_buffer) })],
+                                    None,
                                     None,
                                     None,
                                 )));
@@ -990,7 +1006,7 @@ fn adk_stream(
                                         },
                                     }));
                                 }
-                                yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None)));
+                                yield Ok(sse_block(&adk_frame(parts, Some("STOP"), None, None)));
                             }
                             log::info!(
                                 "[Accio] stream done, reasoning_chars={reasoning_chars}, elapsed={:?}",
@@ -1740,7 +1756,8 @@ mod tests {
 
     #[test]
     fn emits_top_level_adk_frames_for_text_chunks() {
-        let frame = adk_frame(vec![json!({"text": "HELLO"})], None, None);
+        let frame = adk_frame(vec![json!({"text": "HELLO"})], None, None, Some("{\"id\":\"raw\"}"));
+        assert_eq!(frame["raw_response_json"], "{\"id\":\"raw\"}");
         assert_eq!(frame["content"]["role"], "model");
         assert_eq!(frame["content"]["parts"][0]["text"], "HELLO");
         assert_eq!(frame["turnComplete"], false);
@@ -1755,6 +1772,7 @@ mod tests {
                 "completion_tokens": 3,
                 "total_tokens": 8,
             })),
+            None,
         );
         assert_eq!(final_frame["turnComplete"], true);
         assert_eq!(final_frame["partial"], false);
