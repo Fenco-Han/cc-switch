@@ -1033,9 +1033,38 @@ pub async fn handle_adk_llm(
     request: Request,
 ) -> Result<Response, ProxyError> {
     let (parts, body) = request.into_parts();
-    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+    let raw_body = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|error| ProxyError::Internal(format!("failed to read Accio ADK body: {error}")))?;
+    // Accio 对较大的请求体（例如带 34 个工具、长上下文的 generateContent，实测 >~几十 KB）
+    // 会带 `Content-Encoding: gzip` 发送。若不解压，下面的 serde_json 会因为拿到的是
+    // 压缩字节而解析失败，表现为「本地代理直接报 invalid Accio ADK JSON」。这里复用
+    // 与 Codex 相同的解压工具，按 content-encoding 解压后再解析。
+    let body_bytes = if let Some(encoding) =
+        super::content_encoding::get_content_encoding(&parts.headers)
+    {
+        if !super::content_encoding::is_supported_content_encoding(&encoding) {
+            return Err(ProxyError::InvalidRequest(format!(
+                "Unsupported request content-encoding: {encoding}"
+            )));
+        }
+        log::debug!("[Accio] 解压请求体: content-encoding={encoding}");
+        match super::content_encoding::decompress_body(&encoding, &raw_body) {
+            Ok(Some(decompressed)) => Bytes::from(decompressed),
+            Ok(None) => {
+                return Err(ProxyError::InvalidRequest(format!(
+                    "Unsupported request content-encoding: {encoding}"
+                )));
+            }
+            Err(error) => {
+                return Err(ProxyError::InvalidRequest(format!(
+                    "Failed to decompress Accio request body ({encoding}): {error}"
+                )));
+            }
+        }
+    } else {
+        raw_body
+    };
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|error| ProxyError::InvalidRequest(format!("invalid Accio ADK JSON: {error}")))?;
 
@@ -1273,6 +1302,33 @@ pub async fn handle_accio_models(
 ) -> Result<Json<Value>, ProxyError> {
     let providers = accio_providers(&state)?;
     Ok(Json(model_catalog_response(&providers)))
+}
+
+/// 子代理模型路由策略：`POST /accio/api/llm/subAgent/routing`。
+///
+/// 官方网关下发的策略是 `defaultAction: { "type": "fixed_model",
+/// "modelCode": "1Nova-..." }`（外加 `browser-pinned-model` 等规则），会让所有子代理
+/// 固定走云端模型 —— 这正是「主会话走本地自定义模型、子代理却仍走云端」的根因。
+///
+/// 这里拦截该端点，把 `defaultAction` 改写成 `inherit_parent`（并清空 ruleList），
+/// 使子代理继承主会话当前使用的自定义模型。返回体字段与官方网关保持同构，只是内容
+/// 被改写，以保证 Accio 策略解析器（`FT(VT(r))`）能正常接受。
+///
+/// 说明：`accio_config::rewrite_subagent_model_routing`（启动时改磁盘缓存
+/// `subagent_model_routing_cache.json`）是另一层兜底；本端点级拦截优先级更高，可
+/// 在 Accio 每次重新拉取策略后立即生效，不依赖启动时刻。
+pub async fn handle_accio_subagent_routing() -> Result<Json<Value>, ProxyError> {
+    log::info!("[Accio] subAgent/routing -> inherit_parent (follow main session model)");
+    Ok(Json(json!({
+        "success": true,
+        "code": "200",
+        "message": "0",
+        "data": {
+            "version": "cc-switch-local",
+            "ruleList": [],
+            "defaultAction": { "type": "inherit_parent", "modelCode": Value::Null }
+        }
+    })))
 }
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[

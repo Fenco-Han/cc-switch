@@ -303,6 +303,12 @@ impl ProxyServer {
                 "/accio/api/llm/config/v2",
                 post(super::accio_adk::handle_accio_models),
             )
+            // 子代理模型路由策略：改写成 inherit_parent，避免子代理被云端策略强制
+            // 固定到云端模型（否则主会话走本地自定义模型、子代理仍走云端）。
+            .route(
+                "/accio/api/llm/subAgent/routing",
+                post(super::accio_adk::handle_accio_subagent_routing),
+            )
             .route("/accio/*path", any(super::accio_adk::handle_accio_fallback))
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
